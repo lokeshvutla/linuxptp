@@ -535,9 +535,11 @@ static void clock_stats_update(struct clock_stats *s,
 	/* Path delay stats are updated separately, they may be empty. */
 	if (!stats_get_result(s->delay, &delay_stats)) {
 		pr_info("rms %4.0f max %4.0f "
+			"(%4.0f, %4.0f) "
 			"freq %+6.0f +/- %3.0f "
 			"delay %5.0f +/- %3.0f",
 			offset_stats.rms, offset_stats.max_abs,
+			offset_stats.min, offset_stats.max,
 			freq_stats.mean, freq_stats.stddev,
 			delay_stats.mean, delay_stats.stddev);
 	} else {
