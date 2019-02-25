@@ -1019,6 +1019,9 @@ static int autocfg_extts_init_clocks(struct node *node)
 
 	/* disable pps output and latch on all clocks */
 	LIST_FOREACH(clock, &node->clocks, list) {
+		if (clock->clkid == CLOCK_REALTIME)
+			continue;
+
 		pps_output_control(clock->clkid, 0);
 		extts_input_control(clock, CLK_EXTTS_IDX(n, clock), 0);
 
@@ -1103,6 +1106,8 @@ static int do_autocfg_extts_loop(struct node *node, int subscriptions)
 	struct clock *clock;
 	int64_t extts_offset;
 	uint64_t extts_ts;
+	uint64_t ts;
+	int64_t offset, delay;
 	int ret;
 
 	while (is_running()) {
@@ -1142,9 +1147,16 @@ static int do_autocfg_extts_loop(struct node *node, int subscriptions)
 			    !strcmp(clock->device, node->master->device))
 				continue;
 
-			/* Ignore RT clock */
-			if (clock->clkid == CLOCK_REALTIME)
+			/* Process RT clock */
+			if (clock->clkid == CLOCK_REALTIME) {
+				/* use phc */
+				if (read_phc(node->master->clkid, clock->clkid,
+				             node->phc_readings,
+				             &offset, &ts, &delay)) {
+					update_clock(node, clock, offset, ts, delay);
+				}
 				continue;
+			}
 
 			if (clock->state == PS_UNCALIBRATED)
 				continue;
@@ -1163,8 +1175,10 @@ static int do_autocfg_extts_loop(struct node *node, int subscriptions)
 	}
 
 	LIST_FOREACH(clock, &node->clocks, list) {
-		pps_output_control(clock->clkid, 0);
-		extts_input_control(clock, CLK_EXTTS_IDX(n, clock), 0);
+		if (clock->clkid != CLOCK_REALTIME) {
+			pps_output_control(clock->clkid, 0);
+			extts_input_control(clock, CLK_EXTTS_IDX(n, clock), 0);
+		}
 		close(CLOCKID_TO_FD(clock->clkid));
 	}
 
@@ -1958,11 +1972,7 @@ int main(int argc, char *argv[])
 			"autoconfiguration cannot be mixed with manual config options.\n");
 		goto bad_usage;
 	}
-	if (autocfg && rt > 0 && node.use_extts_sync) {
-		fprintf(stderr,
-			"phc extts sync is incompatible cannot be used with system clock in autoconfiguration.\n");
-		goto bad_usage;
-	}
+
 	if (!autocfg && pps_fd < 0 && !src_name) {
 		fprintf(stderr,
 			"autoconfiguration or valid source clock must be selected.\n");
@@ -2008,7 +2018,7 @@ int main(int argc, char *argv[])
 				goto end;
 			r = do_loop(&node, 1);
 		} else {
-			if (auto_init_ports(&node, 0) < 0)
+			if (auto_init_ports(&node, rt) < 0)
 				goto end;
 
 			node.extts_last_master = NULL;
