@@ -281,6 +281,41 @@ int sk_interface_addr(const char *name, int family, struct address *addr)
 	return result;
 }
 
+int sk_set_ts_master_id(const char *name, struct address *addr)
+{
+	struct ethtool_dump dump;
+	struct ifreq ifr;
+	int fd, err;
+	uint8_t mac[MAC_LEN];
+
+	memcpy(mac, &addr->sll.sll_addr, MAC_LEN);
+
+	memset(&ifr, 0, sizeof(ifr));
+	memset(&dump, 0, sizeof(dump));
+	dump.cmd = ETHTOOL_SET_DUMP;
+	dump.version = 0xface;
+	memcpy(&dump.flag, &mac[0], 4);
+	memcpy(&dump.len,  &mac[2], 4);
+	strncpy(ifr.ifr_name, name, IFNAMSIZ - 1);
+	ifr.ifr_data = (char *) &dump;
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+	if (fd < 0) {
+		pr_err("socket failed: %m");
+		goto failed;
+	}
+
+	err = ioctl(fd, SIOCETHTOOL, &ifr);
+	if ((err < 0) && (errno != EOPNOTSUPP)){
+		pr_err("ioctl SIOCETHTOOL failed: %m");
+	}
+
+	close(fd);
+	return err;
+failed:
+	return -1;
+}
+
 static short sk_events = POLLPRI;
 static short sk_revents = POLLPRI;
 

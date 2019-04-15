@@ -2373,6 +2373,11 @@ static void bc_dispatch(struct port *p, enum fsm_event event, int mdiff)
 		port_e2e_transition(p, p->state);
 	}
 
+	if (p->state == PS_UNCALIBRATED) {
+		struct ptp_message *dst = TAILQ_FIRST(&p->best->messages);
+		sk_set_ts_master_id(p->iface->name, &dst->address);
+	}
+
 	if (p->jbod && p->state == PS_UNCALIBRATED) {
 		if (clock_switch_phc(p->clock, p->phc_index)) {
 			p->last_fault_type = FT_SWITCH_PHC;

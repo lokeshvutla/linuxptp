@@ -131,4 +131,5 @@ extern int sk_tx_timeout;
  */
 extern int sk_check_fupsync;
 
+int sk_set_ts_master_id(const char *name, struct address *addr);
 #endif
