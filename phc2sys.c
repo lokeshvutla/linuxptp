@@ -444,6 +444,8 @@ static void reconfigure(struct node *node)
 	LIST_FOREACH(c, &node->clocks, list) {
 		if (c->clkid == CLOCK_REALTIME) {
 			rt = c;
+			LIST_INSERT_HEAD(&node->dst_clocks,
+					 c, dst_list);
 			continue;
 		}
 
