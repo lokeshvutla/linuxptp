@@ -96,6 +96,7 @@ struct port {
 	LIST_ENTRY(port) list;
 	unsigned int number;
 	int state;
+	int pps_offset;
 	struct clock *clock;
 };
 
@@ -137,7 +138,8 @@ static void run_pmc_events(struct node *node);
 static int normalize_state(int state);
 static int run_pmc_port_properties(struct node *node, int timeout,
 				   unsigned int port,
-				   int *state, int *tstamping, char *iface);
+				   int *state, int *tstamping, char *iface,
+				   int *pps_offset);
 
 static clockid_t clock_open(char *device, int *phc_index)
 {
@@ -361,7 +363,7 @@ static void clock_reinit(struct node *node, struct clock *clock, int new_state)
 		if (p->clock == clock) {
 			ret = run_pmc_port_properties(node, 1000, p->number,
 					              &state, &timestamping,
-						      iface);
+						      iface, NULL);
 			if (ret > 0)
 				p->state = normalize_state(state);
 		}
@@ -696,6 +698,18 @@ static void pps_output_control(clockid_t src, int enable)
 		pr_warning("failed to enable PPS output");
 }
 
+static void set_pps_offset(clockid_t src, int offset)
+{
+	if (!phc_has_pps(src)) {
+		pr_warning("src clk %d does not have pps", src);
+		return;
+	}
+
+	pr_info("set_pps_offset(%d): offset = %d", src, offset);
+	if (ioctl(CLOCKID_TO_FD(src), PTP_PPS_OFFSET, offset) < 0)
+		pr_warning("failed to set PPS offset");
+}
+
 static int read_pps(int fd, int64_t *offset, uint64_t *ts)
 {
 	struct pps_fdata pfd;
@@ -866,8 +880,10 @@ static int read_extts(int fd, int64_t *offset, uint64_t *ts, int extts_idx)
 	*ts += event.t.nsec;
 
 	*offset = *ts % NS_PER_SEC;
-	if (*offset > NS_PER_SEC / 2)
+	if (*offset > NS_PER_SEC / 2) {
 		*offset -= NS_PER_SEC;
+		*ts += NS_PER_SEC;
+	}
 
 	return 1;
 }
@@ -955,19 +971,34 @@ static int do_extts_loop(struct node *node, struct clock *clock, int extts_idx)
 static void autocfg_extts_clock_settime(struct node *node,
 					clockid_t src_id, clockid_t dst_id)
 {
-	int64_t dst_offset, delay;
-	uint64_t dst_ts, src_ts;
-	struct timespec tspec;
+	int64_t dst_offset, delay, adj_sec;
+	uint64_t dst_ts;
+	int neg = 0;
 
 	if (!read_phc(src_id, dst_id, node->phc_readings,
 		      &dst_offset, &dst_ts, &delay)){
 		pr_info("read_phc(%d, %d) failed", src_id, dst_id);
 		return;
 	}
-	src_ts = dst_ts - dst_offset;
-	tspec.tv_sec = src_ts / NS_PER_SEC;
-	tspec.tv_nsec = src_ts - (tspec.tv_sec * NS_PER_SEC);
-	clock_settime(dst_id, &tspec);
+
+	if (dst_offset < 0) {
+		/* need a positive adj to bring dst clock
+		 * to the same SEC as the src clock.
+		 */
+		adj_sec = -dst_offset;
+	} else {
+		neg = 1;
+		adj_sec = dst_offset;
+	}
+
+	adj_sec = (adj_sec / NS_PER_SEC) * NS_PER_SEC;
+	if (!adj_sec)
+		return;
+
+	if (neg)
+		adj_sec = -adj_sec;
+
+	clockadj_step(dst_id, adj_sec);
 }
 
 static int autocfg_extts_init_clocks(struct node *node)
@@ -1124,6 +1155,10 @@ static int do_autocfg_extts_loop(struct node *node, int subscriptions)
 				continue;
 
 			update_clock(node, clock, extts_offset, extts_ts, -1);
+
+			autocfg_extts_clock_settime(node, node->master->clkid,
+						    clock->clkid);
+
 		}
 	}
 
@@ -1441,7 +1476,8 @@ static void run_pmc_events(struct node *node)
 
 static int run_pmc_port_properties(struct node *node, int timeout,
 				   unsigned int port,
-				   int *state, int *tstamping, char *iface)
+				   int *state, int *tstamping, char *iface,
+				   int *pps_offset)
 {
 	struct ptp_message *msg;
 	int res, len;
@@ -1461,6 +1497,8 @@ static int run_pmc_port_properties(struct node *node, int timeout,
 
 		*state = ppn->port_state;
 		*tstamping = ppn->timestamping;
+		if (pps_offset)
+			*pps_offset = ppn->pps_offset;
 		len = ppn->interface.length;
 		if (len > IFNAMSIZ - 1)
 			len = IFNAMSIZ - 1;
@@ -1506,7 +1544,7 @@ static int auto_init_ports(struct node *node, int add_rt)
 	struct clock *clock;
 	int number_ports, res;
 	unsigned int i;
-	int state, timestamping;
+	int state, timestamping, pps_offset;
 	char iface[IFNAMSIZ];
 
 	while (1) {
@@ -1535,7 +1573,8 @@ static int auto_init_ports(struct node *node, int add_rt)
 
 	for (i = 1; i <= number_ports; i++) {
 		res = run_pmc_port_properties(node, 1000, i, &state,
-					      &timestamping, iface);
+					      &timestamping, iface,
+					      &pps_offset);
 		if (res == -1) {
 			/* port does not exist, ignore the port */
 			continue;
@@ -1552,6 +1591,10 @@ static int auto_init_ports(struct node *node, int add_rt)
 		if (!port)
 			return -1;
 		port->state = normalize_state(state);
+
+		if (port->clock)
+			set_pps_offset(port->clock->clkid, pps_offset);
+
 	}
 	if (LIST_EMPTY(&node->clocks)) {
 		pr_err("no suitable ports available");

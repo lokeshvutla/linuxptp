@@ -75,6 +75,10 @@ enum {
 #define SO_SELECT_ERR_QUEUE 45
 #endif
 
+#ifndef PTP_PPS_OFFSET
+#define PTP_PPS_OFFSET     _IOW('=', 9, int)
+#endif
+
 #ifndef HAVE_CLOCK_ADJTIME
 static inline int clock_adjtime(clockid_t id, struct timex *tx)
 {

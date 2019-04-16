@@ -909,6 +909,7 @@ static int port_management_fill_response(struct port *target,
 		else
 			ppn->port_state = target->state;
 		ppn->timestamping = target->timestamping;
+		ppn->pps_offset = target->ppsOffset;
 		ptp_text_set(&ppn->interface, target->iface->ts_label);
 		datalen = sizeof(*ppn) + ppn->interface.length;
 		break;
@@ -2888,6 +2889,7 @@ struct port *port_open(int phc_index,
 	p->rx_timestamp_offset <<= 16;
 	p->tx_timestamp_offset = config_get_int(cfg, p->name, "egressLatency");
 	p->tx_timestamp_offset <<= 16;
+	p->ppsOffset = config_get_int(cfg, p->name, "ppsOffset");
 	p->link_status = LINK_UP;
 	p->clock = clock;
 	p->trp = transport_create(cfg, transport);
