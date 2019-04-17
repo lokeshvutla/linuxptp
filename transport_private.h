@@ -47,6 +47,22 @@ struct transport {
 	int (*physical_addr)(struct transport *t, uint8_t *addr);
 
 	int (*protocol_addr)(struct transport *t, uint8_t *addr);
+
+	int (*red_recv)(struct transport *t, int fd, void *buf, int buflen,
+			struct address *addr, struct hw_timestamp *hwts,
+			struct redundant_info *redinfo,
+			struct hw_timestamp *red_hwts);
+
+	int (*red_sendmsg)(struct transport *t, struct fdarray *fda, int event,
+			   int peer, void *buf, int buflen, struct address *addr,
+			   struct hw_timestamp *hwts,
+			   struct redundant_info *redinfo);
+
+	int (*red_cut_thru_msg)(struct transport *t, struct fdarray *fda,
+				int event, int peer, void *buf, int buflen,
+				struct address *addr, struct address *src_addr,
+				struct hw_timestamp *hwts,
+				struct redundant_info *redinfo);
 };
 
 #endif
