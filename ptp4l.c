@@ -76,6 +76,7 @@ int main(int argc, char *argv[])
 	struct clock *clock = NULL;
 	struct option *opts;
 	struct config *cfg;
+	int dac;
 
 	if (handle_term_signals())
 		return -1;
@@ -240,7 +241,15 @@ int main(int argc, char *argv[])
 		goto out;
 	}
 
-	clock = clock_create(type, cfg, req_phc);
+	dac = config_get_int(cfg, NULL, "doubly_attached_clock");
+	if (dac == 1)
+		/* doubly attached OC */
+		clock = clock_create(CLOCK_TYPE_ORDINARY, cfg, req_phc);
+	else if (dac == 2)
+		/* doubly attached BC */
+		clock = clock_create(CLOCK_TYPE_BOUNDARY, cfg, req_phc);
+	else
+		clock = clock_create(type, cfg, req_phc);
 	if (!clock) {
 		fprintf(stderr, "failed to create a clock\n");
 		goto out;
