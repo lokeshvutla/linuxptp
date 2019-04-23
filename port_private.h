@@ -74,6 +74,7 @@ struct port {
 	enum fsm_event (*event)(struct port *p, int fd_index);
 
 	int jbod;
+	int redundancy; /* 0 = none, 1 = hsr, 2 = prp. jbod incompatible */
 	struct foreign_clock *best;
 	enum syfu_state syfu;
 	struct ptp_message *last_syncfup;
@@ -153,6 +154,15 @@ struct port {
 	int inhibit_multicast_service;
 	/* slave event monitoring */
 	struct monitor *slave_event_monitor;
+
+	int red_port_lanid; /* pre-BMCA HACK */
+	int red_port_active; /* pre-BMCA HACK */
+	struct port *red_slave[2];          /* used by red_master */
+	struct interface *red_master_iface; /* used by red_slave */
+	struct port *red_master_port;       /* used by red_slave */
+	struct port *red_pair_port;         /* used by red_slave */
+	struct port *red_dispatch_port;     /* used in clock poll */
+	int red_rx_sync_missed;
 };
 
 #define portnum(p) (p->portIdentity.portNumber)
