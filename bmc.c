@@ -166,10 +166,12 @@ enum port_state bmc_state_decision(struct clock *c, struct port *r,
 		return PS_SLAVE; /*S1*/
 	}
 
-	if (red_slave_port(r)) {
-		/* clock best is not on this port, i.e., the other
-		 * port will get PS_SLAVE. So this port should be
-		 * PSLAVE
+	if (red_slave_port(r) &&
+	    (red_get_master_port(r) ==
+	     red_get_master_port(clock_best_port(c)))) {
+		/* clock best is not on this port, if it is a redundancy port
+		 * and its master port is the clock master, then this port
+		 * should be PSLAVE
 		 */
 		return PS_PASSIVE_SLAVE;
 	}

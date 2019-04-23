@@ -342,4 +342,5 @@ struct port *port_get_dispatch_port(struct port *p);
 void port_release_dispatch_port(struct port *orig, struct port *p);
 char *port_name(struct port *p);
 short port_fault_fd_events(struct port *port);
+struct port *red_get_master_port(struct port *p);
 #endif

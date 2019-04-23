@@ -3800,3 +3800,8 @@ int red_port_quality(struct port *port)
 {
 	return port ? port->red_rx_sync_missed : 0;
 }
+
+struct port *red_get_master_port(struct port *p)
+{
+	return p->red_master_port;
+}

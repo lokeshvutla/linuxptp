@@ -82,6 +82,7 @@ struct clock {
 	int sync_offset;
 	int leap_set;
 	int utc_offset_set;
+	int dup_phc;
 	struct servo *servo;
 	enum servo_state servo_state;
 	char *device;
@@ -462,6 +463,7 @@ static void reconfigure(struct node *node)
 		case PS_PRE_MASTER:
 		case PS_MASTER:
 		case PS_PASSIVE:
+		        c->dup_phc = FALSE;
 			dup = find_dst_clock(node, c->phc_index);
 			if (!dup) {
 				pr_info("selecting %s for synchronization",
@@ -470,6 +472,7 @@ static void reconfigure(struct node *node)
 				LIST_INSERT_HEAD(&node->dst_clocks,
 						 c, dst_list);
 			} else {
+				c->dup_phc = TRUE;
 				pr_info("skipping %s: %s has the same clock "
 					"and is already selected",
 					c->device, dup->device);
@@ -1024,11 +1027,15 @@ static int autocfg_extts_init_clocks(struct node *node)
 		if (clock->clkid == CLOCK_REALTIME)
 			continue;
 
+		if (clock->dup_phc)
+			continue;
+
 		pps_output_control(clock->clkid, 0);
 		extts_input_control(clock, CLK_EXTTS_IDX(n, clock), 0);
 
 		if (IS_CPTS_CLOCK(n, clock))
 			cpts = clock;
+
 	}
 
 	/* enable pps output on master clock */
@@ -1044,6 +1051,9 @@ static int autocfg_extts_init_clocks(struct node *node)
 				continue;
 
 			if (clock->state == PS_UNCALIBRATED)
+				continue;
+
+			if (clock->dup_phc)
 				continue;
 
 			autocfg_extts_clock_settime(node,
@@ -1091,6 +1101,9 @@ static int autocfg_extts_init_clocks(struct node *node)
 			continue;
 
 		if (clock->state == PS_UNCALIBRATED)
+			continue;
+
+		if (clock->dup_phc)
 			continue;
 
 		autocfg_extts_clock_settime(node, master_clkid,
@@ -1177,7 +1190,8 @@ static int do_autocfg_extts_loop(struct node *node, int subscriptions)
 	}
 
 	LIST_FOREACH(clock, &node->clocks, list) {
-		if (clock->clkid != CLOCK_REALTIME) {
+		if ((clock->clkid != CLOCK_REALTIME) &&
+		    (!clock->dup_phc)) {
 			pps_output_control(clock->clkid, 0);
 			extts_input_control(clock, CLK_EXTTS_IDX(n, clock), 0);
 		}

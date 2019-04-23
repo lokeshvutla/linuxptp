@@ -1152,7 +1152,7 @@ struct clock *clock_create(enum clock_type type, struct config *config,
 		}
 	}
 
-	c->dds.numberPorts = c->nports;
+	c->dds.numberPorts = c->nports + c->n_red_master_ports;
 
 	/* Link up redundant paired ports as
 	 * well as redundant master and slave
