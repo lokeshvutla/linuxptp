@@ -19,6 +19,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <malloc.h>
+#include <poll.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -57,6 +58,31 @@ enum syfu_event {
 static int port_capable(struct port *p);
 static int port_is_ieee8021as(struct port *p);
 static void port_nrate_initialize(struct port *p);
+
+static int red_port(struct port *p);
+
+char *state_name[] = {
+	"UNKNOWN",
+	"INITIALIZING",
+	"FAULTY",
+	"DISABLED",
+	"LISTENING",
+	"PRE_MASTER",
+	"MASTER",
+	"PASSIVE",
+	"UNCALIBRATED",
+	"SLAVE",
+	"PASSIVE_SLAVE",
+	"GRAND_MASTER",
+};
+
+static inline char *port_state_name(struct port *p)
+{
+	if (p->state > PS_GRAND_MASTER)
+		return state_name[0];
+
+	return state_name[p->state];
+}
 
 static int announce_compare(struct ptp_message *m1, struct ptp_message *m2)
 {
@@ -233,7 +259,6 @@ int set_tmo_random(int fd, int min, int span, int log_seconds)
 
 	tmo.it_value.tv_sec = value_ns / NS_PER_SEC;
 	tmo.it_value.tv_nsec = value_ns % NS_PER_SEC;
-
 	return timerfd_settime(fd, 0, &tmo, NULL);
 }
 
@@ -316,6 +341,13 @@ void ts_add(tmv_t *ts, Integer64 correction)
 		return;
 	}
 	*ts = tmv_add(*ts, correction_to_tmv(correction));
+}
+
+static void hton_timestamp(struct timestamp *src, struct Timestamp *dst)
+{
+	dst->seconds_lsb = src->sec & 0xffffffff;
+	dst->seconds_msb = (src->sec >> 32) & 0xffff;
+	dst->nanoseconds = src->nsec;
 }
 
 /*
@@ -564,17 +596,41 @@ static int path_trace_ignore(struct port *p, struct ptp_message *m)
 	return 0;
 }
 
+static int red_hsr_port(struct port *p)
+{
+	return (p->redundancy == 1);
+}
+
+static int red_prp_port(struct port *p)
+{
+	return (p->redundancy == 2);
+}
+
+static int red_port(struct port *p)
+{
+	return red_hsr_port(p) || red_prp_port(p);
+}
+
 static int peer_prepare_and_send(struct port *p, struct ptp_message *msg,
 				 enum transport_event event)
 {
 	int cnt;
+	struct transport *t;
+	struct fdarray *fda;
+
 	if (msg_pre_send(msg)) {
 		return -1;
 	}
 	if (msg_unicast(msg)) {
 		cnt = transport_sendto(p->trp, &p->fda, event, msg);
 	} else {
-		cnt = transport_peer(p->trp, &p->fda, event, msg);
+		if (red_hsr_port(p)) {
+			t = p->red_master_port->trp;
+			fda = &p->red_master_port->fda;
+			cnt = transport_red_peermsg(t, fda, event, msg);
+		} else {
+			cnt = transport_peer(p->trp, &p->fda, event, msg);
+		}
 	}
 	if (cnt <= 0) {
 		return -1;
@@ -582,6 +638,7 @@ static int peer_prepare_and_send(struct port *p, struct ptp_message *msg,
 	if (msg_sots_valid(msg)) {
 		ts_add(&msg->hwts.ts, p->tx_timestamp_offset);
 	}
+
 	return 0;
 }
 
@@ -1073,11 +1130,14 @@ void port_show_transition(struct port *p, enum port_state next,
 			  enum fsm_event event)
 {
 	if (event == EV_FAULT_DETECTED) {
-		pr_notice("port %hu: %s to %s on %s (%s)", portnum(p),
+		pr_notice("port %hu (%s): %s to %s on %s (%s)", portnum(p),
+			  p->iface->name,
 			  ps_str[p->state], ps_str[next], ev_str[event],
 			  ft_str(last_fault_type(p)));
 	} else {
-		pr_notice("port %hu: %s to %s on %s", portnum(p),
+		pr_notice("%sport %hu (%s): %s to %s on %s",
+			  red_slave_port(p) ? "red " : "", portnum(p),
+			  p->iface->name,
 			  ps_str[p->state], ps_str[next], ev_str[event]);
 	}
 }
@@ -1097,6 +1157,12 @@ static void port_synchronize(struct port *p,
 	enum servo_state state;
 	tmv_t t1, t1c, t2, c1, c2;
 
+	if (p->state == PS_PASSIVE_SLAVE) {
+		pr_debug("port %hu: PASSIVE SLAVE not allowed to sync",
+			portnum(p));
+		return;
+	}
+
 	port_set_sync_rx_tmo(p);
 
 	t1 = timestamp_to_tmv(origin_ts);
@@ -1106,6 +1172,7 @@ static void port_synchronize(struct port *p,
 	t1c = tmv_add(t1, tmv_add(c1, c2));
 
 	state = clock_synchronize(p->clock, t2, t1c);
+
 	switch (state) {
 	case SERVO_UNLOCKED:
 		port_dispatch(p, EV_SYNCHRONIZATION_FAULT, 0);
@@ -1243,23 +1310,34 @@ static int port_pdelay_request(struct port *p)
 		msg->header.flagField[0] |= UNICAST;
 	}
 
+	if (red_hsr_slave_port(p))
+		msg->redinfo.io_port = (DIRECTED_TX | BIT(p->red_port_lanid));
+
+
 	err = peer_prepare_and_send(p, msg, TRANS_EVENT);
 	if (err) {
 		pr_err("port %hu: send peer delay request failed", portnum(p));
 		goto out;
 	}
-	if (msg_sots_missing(msg)) {
-		pr_err("missing timestamp on transmitted peer delay request");
-		goto out;
+
+	if(!red_port(p)) {
+		if (msg_sots_missing(msg)) {
+			pr_err("missing timestamp on transmitted peer delay request");
+			goto out;
+		}
 	}
 
-	if (p->peer_delay_req) {
-		if (port_capable(p)) {
-			p->pdr_missing++;
+	/* Yes, this is a double check for non-red case */
+	if (!msg_sots_missing(msg)) {
+		if (p->peer_delay_req) {
+			if (port_capable(p)) {
+				p->pdr_missing++;
+			}
+			msg_put(p->peer_delay_req);
 		}
-		msg_put(p->peer_delay_req);
+		p->peer_delay_req = msg;
 	}
-	p->peer_delay_req = msg;
+
 	return 0;
 out:
 	msg_put(msg);
@@ -1371,11 +1449,15 @@ int port_tx_announce(struct port *p, struct address *dst)
 		pr_err("port %hu: append path trace failed", portnum(p));
 	}
 
+	if (red_slave_port(p))
+		msg->redinfo.io_port = (DIRECTED_TX | BIT(p->red_port_lanid));
+
 	err = port_prepare_and_send(p, msg, TRANS_GENERAL);
 	if (err) {
 		pr_err("port %hu: send announce failed", portnum(p));
 	}
 	msg_put(msg);
+
 	return err;
 }
 
@@ -1439,6 +1521,10 @@ int port_tx_sync(struct port *p, struct address *dst)
 		msg->header.flagField[0] |= UNICAST;
 		msg->header.logMessageInterval = 0x7f;
 	}
+
+	if (red_slave_port(p))
+		msg->redinfo.io_port = (DIRECTED_TX | BIT(p->red_port_lanid));
+
 	err = port_prepare_and_send(p, msg, event);
 	if (err) {
 		pr_err("port %hu: send sync failed", portnum(p));
@@ -1478,6 +1564,12 @@ int port_tx_sync(struct port *p, struct address *dst)
 		goto out;
 	}
 
+	if (red_slave_port(p)) {
+		/* Directed send follow-up to port A */
+		memset(&fup->redinfo, 0, sizeof(fup->redinfo));
+		fup->redinfo.io_port = (DIRECTED_TX | BIT(p->red_port_lanid));
+	}
+
 	err = port_prepare_and_send(p, fup, TRANS_GENERAL);
 	if (err) {
 		pr_err("port %hu: send follow up failed", portnum(p));
@@ -1505,6 +1597,7 @@ int port_is_enabled(struct port *p)
 	case PS_PASSIVE:
 	case PS_UNCALIBRATED:
 	case PS_SLAVE:
+	case PS_PASSIVE_SLAVE:
 		break;
 	}
 	return 1;
@@ -1606,8 +1699,15 @@ int port_initialize(struct port *p)
 			goto no_timers;
 		}
 	}
-	if (transport_open(p->trp, p->iface, &p->fda, p->timestamping))
-		goto no_tropen;
+
+	/* TODO: ignore red slave ports from transport_open() */
+	if (!red_port(p) || red_hsr_master_port(p) || red_prp_slave_port(p)) {
+		if (transport_open(p->trp, p->iface, &p->fda, p->timestamping))
+			goto no_tropen;
+	} else {
+		p->fda.fd[FD_EVENT] = -1;
+		p->fda.fd[FD_GENERAL] = -1;
+	}
 
 	for (i = 0; i < N_TIMER_FDS; i++) {
 		p->fda.fd[FD_FIRST_TIMER + i] = fd[i];
@@ -1628,9 +1728,46 @@ int port_initialize(struct port *p)
 			rtnl_link_query(p->fda.fd[FD_RTNL], p->iface->name);
 	}
 
+	/* For redundancy, limit the fds to be monitored:
+	 *   red master - Transport fds for tx/rx and RTNL fd, NO timer fds.
+	 *   red slave  - Timer and RTNL fds, NO trasport fds.
+	 */
+	if (red_hsr_master_port(p)) {
+		/* hsr parent port */
+		p->fda.events[FD_EVENT]   = POLLIN|POLLPRI;
+		p->fda.events[FD_GENERAL] = POLLIN|POLLPRI;
+		for (i = 0; i < N_TIMER_FDS; i++)
+			p->fda.events[FD_FIRST_TIMER + i] = 0;
+
+		p->fda.events[FD_RTNL] = POLLIN|POLLPRI;
+		p->fda.events_valid = 1;
+	} else if (red_hsr_slave_port(p)) {
+		/* hsr slave1/2 port */
+		p->fda.events[FD_EVENT]   = 0;
+		p->fda.events[FD_GENERAL] = 0;
+		for (i = 0; i < N_TIMER_FDS; i++)
+			p->fda.events[FD_FIRST_TIMER + i] = POLLIN|POLLPRI;
+
+		p->fda.events[FD_RTNL] = POLLIN|POLLPRI;
+		p->fda.events_valid = 1;
+	} else if (red_prp_master_port(p)) {
+		/* prp master does not monitior any */
+		p->fda.events[FD_EVENT]   = 0;
+		p->fda.events[FD_GENERAL] = 0;
+		for (i = 0; i < N_TIMER_FDS; i++)
+			p->fda.events[FD_FIRST_TIMER + i] = 0;
+
+		p->fda.events[FD_RTNL] = POLLIN|POLLPRI;
+		p->fda.events_valid = 1;
+	} else {
+		/* No limit on the fds to be monitored */
+		p->fda.events_valid = 0;
+	}
+
 	port_nrate_initialize(p);
 
 	clock_fda_changed(p->clock);
+
 	return 0;
 
 no_tmo:
@@ -1728,6 +1865,7 @@ int process_announce(struct port *p, struct ptp_message *m)
 	case PS_PRE_MASTER:
 	case PS_MASTER:
 	case PS_GRAND_MASTER:
+	case PS_PASSIVE_SLAVE:
 		result = add_foreign_master(p, m);
 		break;
 	case PS_PASSIVE:
@@ -1858,10 +1996,67 @@ void process_delay_resp(struct port *p, struct ptp_message *m)
 	port_set_delay_tmo(p);
 }
 
+static int red_sync_residence_time(struct port *p, struct ptp_message *sync,
+				   TimeInterval *res_tm)
+{
+	if (msg_red_sots_valid(sync) &&
+	    sync->red_hwts.ts.ns < sync->hwts.ts.ns) {
+		pr_err("%s: SYNC cut-thru ts ERROR: ct=%llu, rx=%llu",
+		       p->name,
+		       sync->red_hwts.ts.ns, sync->red_hwts.ts.ns);
+		return -1;
+	}
+
+	*res_tm = tmv_to_TimeInterval(tmv_sub(sync->red_hwts.ts, sync->hwts.ts));
+	return 0;
+}
+
+static int red_tc_correct_forward_follow_up(struct port *rx_port,
+					    struct ptp_message *sync,
+					    struct ptp_message *fup)
+{
+	struct port *pp = rx_port->red_pair_port;
+	int tx_port, err;
+	TimeInterval res_tm;
+
+	if (!red_hsr_port(rx_port) || !pp || !red_hsr_port(pp))
+		return -EINVAL;
+
+	/* if no cut-thru happening, this will be < 0 */
+	err = red_sync_residence_time(rx_port, sync, &res_tm);
+	if (err < 0)
+		return -EINVAL;
+
+	/* Add corrections */
+	fup->header.correction += (rx_port->peerMeanPathDelay + res_tm);
+
+	hton_timestamp(&fup->ts.pdu, &fup->follow_up.preciseOriginTimestamp);
+
+	/* Indicate this is a directed tx and tag info in
+	 * follow-up will be re-used (as much as possible)
+	 */
+	if (rx_port->red_port_lanid == 0)
+		tx_port = RED_PORT_B;
+	else
+		tx_port = RED_PORT_A;
+
+	fup->redinfo.io_port = (DIRECTED_TX | tx_port);
+
+	err = port_prepare_and_send(pp, fup, 0);
+	if (err)
+		pr_err("port %hu: send follow up failed", portnum(pp));
+
+	return 0;
+}
+
 void process_follow_up(struct port *p, struct ptp_message *m)
 {
 	enum syfu_event event;
 	struct PortIdentity master;
+	int correct_forward = 0;
+	struct foreign_clock *fc;
+	int accept = 0;
+
 	switch (p->state) {
 	case PS_INITIALIZING:
 	case PS_FAULTY:
@@ -1874,11 +2069,26 @@ void process_follow_up(struct port *p, struct ptp_message *m)
 		return;
 	case PS_UNCALIBRATED:
 	case PS_SLAVE:
+	case PS_PASSIVE_SLAVE:
 		break;
 	}
 	master = clock_parent_identity(p->clock);
 	if (!pid_eq(&master, &m->header.sourcePortIdentity)) {
-		return;
+		if (red_slave_port(p)) {
+			/* May be it is from a different port on the same
+			 * master clock
+			 */
+			LIST_FOREACH(fc, &p->foreign_masters, list) {
+				if (msg_source_equal(m, fc)) {
+					accept = 1;
+					break;
+				}
+			}
+			if (!accept)
+				return;
+		} else {
+			return;
+		}
 	}
 
 	if (p->follow_up_info) {
@@ -1891,10 +2101,25 @@ void process_follow_up(struct port *p, struct ptp_message *m)
 	if (p->syfu == SF_HAVE_SYNC &&
 	    p->last_syncfup->header.sequenceId == m->header.sequenceId) {
 		event = FUP_MATCH;
+		/* Prepare to do correction and forward fup on to
+		 * the other port
+		 */
+		if (red_hsr_port(p) && msg_red_sots_valid(p->last_syncfup)) {
+			msg_get(p->last_syncfup); /* sync */
+			msg_get(m);               /* fup */
+			correct_forward = 1;
+			p->red_rx_sync_missed = 0;
+		}
 	} else {
 		event = FUP_MISMATCH;
 	}
 	port_syfufsm(p, event, m);
+
+	if (correct_forward) {
+		red_tc_correct_forward_follow_up(p, p->last_syncfup, m);
+		msg_put(p->last_syncfup); /* sync */
+		msg_put(m);               /* fup */
+	}
 }
 
 int process_pdelay_req(struct port *p, struct ptp_message *m)
@@ -1984,19 +2209,6 @@ int process_pdelay_req(struct port *p, struct ptp_message *m)
 		rsp->header.flagField[0] |= UNICAST;
 	}
 
-	err = peer_prepare_and_send(p, rsp, event);
-	if (err) {
-		pr_err("port %hu: send peer delay response failed", portnum(p));
-		goto out;
-	}
-	if (p->timestamping == TS_P2P1STEP) {
-		goto out;
-	} else if (msg_sots_missing(rsp)) {
-		pr_err("missing timestamp on transmitted peer delay response");
-		err = -1;
-		goto out;
-	}
-
 	/*
 	 * Send the follow up message right away.
 	 */
@@ -2013,6 +2225,35 @@ int process_pdelay_req(struct port *p, struct ptp_message *m)
 	fup->header.logMessageInterval = 0x7f;
 
 	fup->pdelay_resp_fup.requestingPortIdentity = m->header.sourcePortIdentity;
+
+	if (red_hsr_port(p)) {
+		memset(&rsp->redinfo, 0, sizeof(rsp->redinfo));
+		memset(&fup->redinfo, 0, sizeof(fup->redinfo));
+		if (MSG_RED_PORTS(m) == RED_PORT_A) {
+			rsp->redinfo.io_port = (DIRECTED_TX | RED_PORT_A);
+			fup->redinfo.io_port = (DIRECTED_TX | RED_PORT_A);
+		} else if (MSG_RED_PORTS(m) == RED_PORT_B) {
+			rsp->redinfo.io_port = (DIRECTED_TX | RED_PORT_B);
+			fup->redinfo.io_port = (DIRECTED_TX | RED_PORT_B);
+		} else {
+			pr_err("Error: Rx msg %d on port A&B simultaneously???",
+				msg_type(m));
+			return -1;
+		}
+	}
+
+	err = peer_prepare_and_send(p, rsp, event);
+	if (err) {
+		pr_err("port %hu: send peer delay response failed", portnum(p));
+		goto out;
+	}
+	if (p->timestamping == TS_P2P1STEP) {
+		goto out;
+	} else if (msg_sots_missing(rsp)) {
+		pr_err("missing timestamp on transmitted peer delay response");
+		err = -1;
+		goto out;
+	}
 
 	fup->pdelay_resp_fup.responseOriginTimestamp =
 		tmv_to_Timestamp(rsp->hwts.ts);
@@ -2104,6 +2345,91 @@ calc:
 	p->peer_delay_req = NULL;
 }
 
+static struct hw_timestamp *
+red_port_get_event_ts(struct port *p, struct ptp_message *event)
+{
+	return &event->hwts;
+}
+
+static void red_port_peer_delay(struct port *p)
+{
+	tmv_t c1, c2, t1, t2, t3, t3c, t4;
+	struct ptp_message *req = p->peer_delay_req;
+	struct ptp_message *rsp = p->peer_delay_resp;
+	struct ptp_message *fup = p->peer_delay_fup;
+	struct hw_timestamp *req_hwts;
+
+	/* Check for response, validate port and sequence number. */
+
+	if (!rsp)
+		return;
+
+	if (!pid_eq(&rsp->pdelay_resp.requestingPortIdentity, &p->portIdentity))
+		return;
+
+	if (rsp->header.sequenceId != ntohs(req->header.sequenceId))
+		return;
+
+	if (red_hsr_port(p)) {
+		req_hwts = red_port_get_event_ts(p, req);
+		t1 = req_hwts->ts;
+	} else {
+		t1 = req->hwts.ts;
+	}
+	t4 = rsp->hwts.ts;
+	c1 = correction_to_tmv(rsp->header.correction + p->asymmetry);
+
+	/* Process one-step response immediately. */
+	if (one_step(rsp)) {
+		t2 = tmv_zero();
+		t3 = tmv_zero();
+		c2 = tmv_zero();
+		goto calc;
+	}
+
+	/* Check for follow up, validate port and sequence number. */
+
+	if (!fup)
+		return;
+
+	if (!pid_eq(&fup->pdelay_resp_fup.requestingPortIdentity, &p->portIdentity))
+		return;
+
+	if (fup->header.sequenceId != rsp->header.sequenceId)
+		return;
+
+	if (!source_pid_eq(fup, rsp))
+		return;
+
+	/* Process follow up response. */
+	t2 = timestamp_to_tmv(rsp->ts.pdu);
+	t3 = timestamp_to_tmv(fup->ts.pdu);
+	c2 = correction_to_tmv(fup->header.correction);
+calc:
+	t3c = tmv_add(t3, tmv_add(c1, c2));
+
+	if (p->follow_up_info)
+		port_nrate_calculate(p, t3c, t4);
+
+	tsproc_set_clock_rate_ratio(p->tsproc, p->nrate.ratio *
+				    clock_rate_ratio(p->clock));
+
+	tsproc_up_ts(p->tsproc, t1, t2);
+	tsproc_down_ts(p->tsproc, t3c, t4);
+	if (tsproc_update_delay(p->tsproc, &p->peer_delay))
+		return;
+
+	p->peerMeanPathDelay = tmv_to_TimeInterval(p->peer_delay);
+
+	if (p->state == PS_UNCALIBRATED || p->state == PS_SLAVE) {
+		clock_peer_delay(p->clock, p->peer_delay, t1, t2,
+				 p->nrate.ratio);
+	}
+
+	msg_put(p->peer_delay_req);
+	p->peer_delay_req = NULL;
+}
+
 int process_pdelay_resp(struct port *p, struct ptp_message *m)
 {
 	if (p->peer_delay_resp) {
@@ -2120,7 +2446,13 @@ int process_pdelay_resp(struct port *p, struct ptp_message *m)
 		}
 	}
 	if (!p->peer_delay_req) {
-		pr_err("port %hu: rogue peer delay response", portnum(p));
+		if (red_port(p))
+			pr_err("port %hu lanid=%u: rogue peer delay response",
+				 portnum(p), p->red_port_lanid);
+		else
+			pr_err("port %hu: rogue peer delay response",
+			       portnum(p));
+
 		return -1;
 	}
 	if (p->peer_portid_valid) {
@@ -2144,7 +2476,10 @@ int process_pdelay_resp(struct port *p, struct ptp_message *m)
 	}
 	msg_get(m);
 	p->peer_delay_resp = m;
-	port_peer_delay(p);
+	if (red_port(p))
+		red_port_peer_delay(p);
+	else
+		port_peer_delay(p);
 	return 0;
 }
 
@@ -2160,13 +2495,86 @@ void process_pdelay_resp_fup(struct port *p, struct ptp_message *m)
 
 	msg_get(m);
 	p->peer_delay_fup = m;
-	port_peer_delay(p);
+	if (red_port(p))
+		red_port_peer_delay(p);
+	else
+		port_peer_delay(p);
+}
+
+struct ptp_message *
+red_tc_one_step_sync_alloc_follow_up(struct port *p, struct ptp_message *sync,
+				     TimeInterval res_time)
+{
+	struct ptp_message *fup;
+	int pdulen;
+
+	fup = msg_allocate();
+	if (!fup)
+		return NULL;
+
+	pdulen = sizeof(struct follow_up_msg);
+	fup->hwts.type = p->timestamping;
+
+	fup->address = sync->address;
+
+	/* See IEC-62439-3 11.5.2.2.b */
+	fup->header.tsmt               = FOLLOW_UP | p->transportSpecific;
+	fup->header.messageLength      = pdulen;
+	fup->header.ver                = sync->header.ver;
+	fup->header.domainNumber       = sync->header.domainNumber;
+	fup->header.sourcePortIdentity = sync->header.sourcePortIdentity;
+	fup->header.sequenceId         = sync->header.sequenceId;
+	fup->header.control            = sync->header.control;
+	fup->header.logMessageInterval = sync->header.logMessageInterval;
+	fup->header.flagField[0]       = sync->header.flagField[0] | TWO_STEP;
+	fup->header.flagField[1]       = sync->header.flagField[1];
+
+	fup->header.correction += (p->peerMeanPathDelay + res_time);
+
+	hton_timestamp(&sync->ts.pdu, &fup->follow_up.preciseOriginTimestamp);
+
+	return fup;
+}
+
+int red_tc_one_step_sync_tx_follow_up(struct port *p, struct ptp_message *sync)
+{
+	struct port *pp = p->red_pair_port;
+	struct ptp_message *fup;
+	int tx_port, err;
+	TimeInterval res_tm;
+
+	err = red_sync_residence_time(p, sync, &res_tm);
+	if (err < 0)
+		return -EINVAL;
+
+	fup = red_tc_one_step_sync_alloc_follow_up(p, sync, res_tm);
+	if (!fup)
+		return -1;
+
+	/* Indicate this is a directed tx. */
+	if (p->red_port_lanid == 0)
+		tx_port = RED_PORT_B;
+	else
+		tx_port = RED_PORT_A;
+
+	fup->redinfo.io_port = (DIRECTED_TX | tx_port);
+
+	err = port_prepare_and_send(pp, fup, 0);
+	if (err)
+		pr_err("port %hu: send follow up failed", portnum(pp));
+
+	msg_put(fup);
+	return 0;
 }
 
 void process_sync(struct port *p, struct ptp_message *m)
 {
 	enum syfu_event event;
 	struct PortIdentity master;
+	int correct_forward = 0;
+	struct foreign_clock *fc;
+	int accept = 0;
+
 	switch (p->state) {
 	case PS_INITIALIZING:
 	case PS_FAULTY:
@@ -2179,11 +2587,26 @@ void process_sync(struct port *p, struct ptp_message *m)
 		return;
 	case PS_UNCALIBRATED:
 	case PS_SLAVE:
+	case PS_PASSIVE_SLAVE:
 		break;
 	}
 	master = clock_parent_identity(p->clock);
 	if (!pid_eq(&master, &m->header.sourcePortIdentity)) {
-		return;
+		if (red_slave_port(p)) {
+			/* May be it is from a different port on the same
+			 * master clock
+			 */
+			LIST_FOREACH(fc, &p->foreign_masters, list) {
+				if (msg_source_equal(m, fc)) {
+					accept = 1;
+					break;
+				}
+			}
+			if (!accept)
+				return;
+		} else {
+			return;
+		}
 	}
 
 	if (!msg_unicast(m) &&
@@ -2198,6 +2621,10 @@ void process_sync(struct port *p, struct ptp_message *m)
 		port_synchronize(p, m->hwts.ts, m->ts.pdu,
 				 m->header.correction, 0);
 		flush_last_sync(p);
+
+		if (red_hsr_port(p) && p->timestamping != TS_ONESTEP)
+			red_tc_one_step_sync_tx_follow_up(p, m);
+
 		return;
 	}
 
@@ -2205,10 +2632,25 @@ void process_sync(struct port *p, struct ptp_message *m)
 	    fup_sync_ok(p->last_syncfup, m) &&
 	    p->last_syncfup->header.sequenceId == m->header.sequenceId) {
 		event = SYNC_MATCH;
+		if (red_hsr_port(p)) {
+			/* Prepare to do correction and forward fup
+			 * on to the other port
+			 */
+			msg_get(m);               /* sync */
+			msg_get(p->last_syncfup); /* fup */
+			correct_forward = 1;
+			p->red_rx_sync_missed = 0;
+		}
 	} else {
 		event = SYNC_MISMATCH;
 	}
 	port_syfufsm(p, event, m);
+
+	if (correct_forward) {
+		red_tc_correct_forward_follow_up(p, m, p->last_syncfup);
+		msg_put(m);               /* sync */
+		msg_put(p->last_syncfup); /* fup */
+	}
 }
 
 /* public methods */
@@ -2234,7 +2676,7 @@ void port_close(struct port *p)
 
 struct foreign_clock *port_compute_best(struct port *p)
 {
-	int (*dscmp)(struct dataset *a, struct dataset *b);
+	int (*dscmp)(struct dataset *a, struct dataset *b, int a_qual, int b_qual);
 	struct foreign_clock *fc;
 	struct ptp_message *tmp;
 
@@ -2258,7 +2700,7 @@ struct foreign_clock *port_compute_best(struct port *p)
 
 		if (!p->best)
 			p->best = fc;
-		else if (dscmp(&fc->dataset, &p->best->dataset) > 0)
+		else if (dscmp(&fc->dataset, &p->best->dataset, 0, 0) > 0)
 			p->best = fc;
 		else
 			fc_clear(fc);
@@ -2306,6 +2748,9 @@ static void port_e2e_transition(struct port *p, enum port_state next)
 		port_set_announce_tmo(p);
 		port_set_delay_tmo(p);
 		break;
+	case PS_PASSIVE_SLAVE:
+		pr_info("PSLAVE: port_e2e_transition: not yet implemented");
+		break;
 	};
 }
 
@@ -2344,9 +2789,15 @@ static void port_p2p_transition(struct port *p, enum port_state next)
 	case PS_UNCALIBRATED:
 		flush_last_sync(p);
 		flush_peer_delay(p);
+		if (red_port(p))
+			port_set_sync_rx_tmo(p);
 		/* fall through */
 	case PS_SLAVE:
 		port_set_announce_tmo(p);
+		break;
+	case PS_PASSIVE_SLAVE:
+		pr_debug("%s PSLAVE: %s: nothing to do ?",
+			p->name, __func__);
 		break;
 	};
 }
@@ -2358,6 +2809,8 @@ void port_dispatch(struct port *p, enum fsm_event event, int mdiff)
 
 static void bc_dispatch(struct port *p, enum fsm_event event, int mdiff)
 {
+	enum port_state prev_state = p->state;
+
 	if (clock_slave_only(p->clock)) {
 		if (event == EV_RS_MASTER || event == EV_RS_GRAND_MASTER) {
 			port_slave_priority_warning(p);
@@ -2365,6 +2818,11 @@ static void bc_dispatch(struct port *p, enum fsm_event event, int mdiff)
 	}
 
 	if (!port_state_update(p, event, mdiff)) {
+		if (p->state == PS_UNCALIBRATED && mdiff) {
+			struct ptp_message *m = TAILQ_FIRST(&p->best->messages);
+
+			sk_set_ts_master_id(p->iface->name, &m->address);
+		}
 		return;
 	}
 
@@ -2374,7 +2832,13 @@ static void bc_dispatch(struct port *p, enum fsm_event event, int mdiff)
 		port_e2e_transition(p, p->state);
 	}
 
-	if (p->state == PS_UNCALIBRATED) {
+
+	/* TI specific */
+	/* In redundancy port, port state can go directly from
+	 * PSLAVE to SLAVE without going through UNCALIBRATE
+	 */
+	if ((p->state == PS_UNCALIBRATED) ||
+	    (red_slave_port(p) && prev_state == PS_PASSIVE_SLAVE && p->state == PS_SLAVE)) {
 		struct ptp_message *dst = TAILQ_FIRST(&p->best->messages);
 		sk_set_ts_master_id(p->iface->name, &dst->address);
 	}
@@ -2445,6 +2909,20 @@ void port_link_status(void *ctx, int linkup, int ts_index)
 		clock_set_sde(p->clock, 1);
 }
 
+static struct port *red_rx_msg_get_port(struct port *p, struct ptp_message *msg)
+{
+	uint8_t in_ports;
+	/*struct port *port = NULL;*/
+
+	in_ports = REDINFO_PORTS(MSG_REDINFO(msg));
+	if (!in_ports || (in_ports & 0x3) == 0x3) {
+		pr_err("receive msg ERROR: in_ports=0x%02x", in_ports);
+		return NULL;
+	}
+
+	return p->red_slave[in_ports >> 1];
+}
+
 enum fsm_event port_event(struct port *p, int fd_index)
 {
 	return p->event(p, fd_index);
@@ -2455,11 +2933,21 @@ static enum fsm_event bc_event(struct port *p, int fd_index)
 	enum fsm_event event = EV_NONE;
 	struct ptp_message *msg;
 	int cnt, fd = p->fda.fd[fd_index], err;
+	struct port *red_master;
+	int orig_syfu_miss;
 
 	switch (fd_index) {
-	case FD_ANNOUNCE_TIMER:
 	case FD_SYNC_RX_TIMER:
-		pr_debug("port %hu: %s timeout", portnum(p),
+		if (red_hsr_port(p)) {
+			p->red_rx_sync_missed++;
+			if (p->best)
+				fc_clear(p->best);
+			pr_err("port %hu: rx sync timeout, %d",
+				portnum(p), p->red_rx_sync_missed);
+			return EV_SYNC_RECEIPT_TIMEOUT_EXPIRES;
+		}
+	case FD_ANNOUNCE_TIMER:
+		pr_err("port %hu: %s timeout", portnum(p),
 			 fd_index == FD_SYNC_RX_TIMER ? "rx sync" : "announce");
 		if (p->best)
 			fc_clear(p->best);
@@ -2511,13 +2999,30 @@ static enum fsm_event bc_event(struct port *p, int fd_index)
 			return EV_NONE;
 	}
 
+	/* In redundancy, slave ports do not receive msgs from
+	 * network directly. Only red master does.
+	 */
+	if (red_hsr_slave_port(p)) {
+		pr_warning("Error: red slave %s receives msgs: fd_index=%d",
+			   p->name, fd_index);
+		return EV_NONE;
+	}
+
 	msg = msg_allocate();
 	if (!msg)
 		return EV_FAULT_DETECTED;
 
+	/* For regular receive timestamp */
 	msg->hwts.type = p->timestamping;
 
-	cnt = transport_recv(p->trp, fd, msg);
+	/* For cut-through event tx timestamp */
+	msg->red_hwts.type = p->timestamping;
+
+	if (red_hsr_port(p))
+		cnt = transport_red_recv(p->trp, fd, msg);
+	else
+		cnt = transport_recv(p->trp, fd, msg);
+
 	if (cnt <= 0) {
 		pr_err("port %hu: recv message failed", portnum(p));
 		msg_put(msg);
@@ -2536,6 +3041,7 @@ static enum fsm_event bc_event(struct port *p, int fd_index)
 		msg_put(msg);
 		return EV_NONE;
 	}
+
 	if (port_ignore(p, msg)) {
 		msg_put(msg);
 		return EV_NONE;
@@ -2552,9 +3058,65 @@ static enum fsm_event bc_event(struct port *p, int fd_index)
 		clock_check_ts(p->clock, tmv_to_nanoseconds(msg->hwts.ts));
 	}
 
+	if (red_hsr_port(p)) {
+		/* Save the red master port that receives the msg */
+		red_master = p;
+		err = msg_post_red_recv(msg);
+		if (err && (msg_type(msg) != SYNC || err != -ETIME)) {
+			/* SYNC and -ETIME is ok because if the other
+			 * port is down, no cut-through will happen and
+			 * hence no tx timestamp.
+			 */
+			pr_err("port %hu: rx %s with unknown error",
+				portnum(p), msg_type_string(msg_type(msg)));
+
+			msg_put(msg);
+			return EV_NONE;
+		}
+
+		switch (msg_type(msg)) {
+		case ANNOUNCE:
+		case SYNC:
+		case FOLLOW_UP: /* for 2-step cut-thru SYNC */
+		case PDELAY_REQ:
+		case PDELAY_RESP:
+		case PDELAY_RESP_FOLLOW_UP:
+			/* The red slave port that is going to
+			 * process the received msg.
+			 */
+			p = red_rx_msg_get_port(p, msg);
+			if (!p) {
+				pr_err("Msg %d: no red port found",
+				       msg_type(msg));
+				msg_put(msg);
+				return EV_NONE;
+			}
+			/* Save the red slave port so that port_dispatch
+			 * will dispatch the right port to process the
+			 * event, e.g. EV_STATE_DECISION, returned after
+			 * processing the received message.
+			 */
+			red_master->red_dispatch_port = p;
+			break;
+		case DELAY_REQ:
+		case DELAY_RESP:
+		case SIGNALING:
+		case MANAGEMENT:
+		default:
+			break;
+		}
+
+		if (msg_type(msg) == SYNC && msg_red_sots_valid(msg)) {
+			ts_add(&msg->red_hwts.ts, p->tx_timestamp_offset);
+		}
+	}
+
 	switch (msg_type(msg)) {
 	case SYNC:
+		orig_syfu_miss = p->red_rx_sync_missed;
 		process_sync(p, msg);
+		if (orig_syfu_miss && !p->red_rx_sync_missed)
+			event = EV_STATE_DECISION_EVENT;
 		break;
 	case DELAY_REQ:
 		if (process_delay_req(p, msg))
@@ -2569,7 +3131,10 @@ static enum fsm_event bc_event(struct port *p, int fd_index)
 			event = EV_FAULT_DETECTED;
 		break;
 	case FOLLOW_UP:
+		orig_syfu_miss = p->red_rx_sync_missed;
 		process_follow_up(p, msg);
+		if (orig_syfu_miss && !p->red_rx_sync_missed)
+			event = EV_STATE_DECISION_EVENT;
 		break;
 	case DELAY_RESP:
 		process_delay_resp(p, msg);
@@ -2610,15 +3175,38 @@ int port_forward_to(struct port *p, struct ptp_message *msg)
 	return cnt <= 0 ? -1 : 0;
 }
 
+int is_zero_mac(struct address *addr)
+{
+	unsigned char *p = &addr->sll.sll_addr[0];
+
+	return p[0] == 0x00 && p[1] == 0x00 &&
+	       p[2] == 0x00 && p[3] == 0x00 &&
+	       p[4] == 0x00 && p[5] == 0x00;
+}
+
 int port_prepare_and_send(struct port *p, struct ptp_message *msg,
 			  enum transport_event event)
 {
 	int cnt;
+	struct transport *t;
+	struct fdarray *fda;
 
 	if (msg_pre_send(msg)) {
 		return -1;
 	}
-	if (msg_unicast(msg)) {
+
+	if (red_hsr_slave_port(p)) {
+		t = p->red_master_port->trp;
+		fda = &p->red_master_port->fda;
+		if (MSG_REDINFO(msg)->lsdu_size)
+			/* for cut-thru fup after correction */
+			cnt = transport_red_cut_thru_msg(t, fda, event, msg);
+		else if (!is_zero_mac(&msg->address))
+			/* for 1-to-2-step conversion */
+			cnt = transport_red_cut_thru_msg(t, fda, event, msg);
+		else
+			cnt = transport_red_sendmsg(t, fda, event, msg);
+	} else if (msg_unicast(msg)) {
 		cnt = transport_sendto(p->trp, &p->fda, event, msg);
 	} else {
 		cnt = transport_send(p->trp, &p->fda, event, msg);
@@ -2629,6 +3217,7 @@ int port_prepare_and_send(struct port *p, struct ptp_message *msg,
 	if (msg_sots_valid(msg)) {
 		ts_add(&msg->hwts.ts, p->tx_timestamp_offset);
 	}
+
 	return 0;
 }
 
@@ -2817,6 +3406,106 @@ err:
 	msg_put(msg);
 }
 
+static int port_redundancy_master_setup(struct port *red_master)
+{
+	struct port *p, *m = red_master;
+
+	m->red_slave[0] = NULL;
+	m->red_slave[1] = NULL;
+
+	for (p = clock_first_port(m->clock); p; p = LIST_NEXT(p, list)) {
+		if (!strcmp(p->iface->name, m->iface->name))
+			continue;
+
+		if (p->redundancy != m->redundancy)
+			continue;
+
+		if (!p->red_master_iface)
+			continue;
+
+		if (strcmp(p->red_master_iface->name, m->iface->name))
+			continue;
+
+		if (p->red_port_lanid == 0)
+			m->red_slave[0] = p;
+		else
+			m->red_slave[1] = p;
+	}
+
+	if (!m->red_slave[0] && !m->red_slave[1])
+		return -1;
+
+	pr_info("%s master %s (port %d): slave1 %s, slave2 %s",
+		m->redundancy == 1 ? "HSR" :
+		(m->redundancy == 2 ? "PRP" : "Unknown redundancy"),
+		m->iface->name, portnum(m),
+		m->red_slave[0] ? m->red_slave[0]->iface->name : "None",
+		m->red_slave[1] ? m->red_slave[1]->iface->name : "None");
+
+	return 0;
+}
+
+static int port_redundancy_slave_setup(struct port *red_slave)
+{
+	struct port *p, *sl = red_slave;
+
+	sl->red_master_port = NULL;
+	sl->red_pair_port = NULL;
+
+	for (p = clock_first_port(sl->clock); p; p = LIST_NEXT(p, list)) {
+		if (!strcmp(p->iface->name, sl->iface->name))
+			continue;
+
+		if (p->redundancy != sl->redundancy)
+			continue;
+
+		if (!strcmp(p->iface->name, sl->red_master_iface->name))
+			sl->red_master_port = p;
+		else if (p->red_master_iface &&
+			 !strcmp(p->red_master_iface->name,
+				 sl->red_master_iface->name))
+			sl->red_pair_port = p;
+	}
+
+	if (!sl->red_master_port)
+		return -1;
+
+	pr_info("%s slave%d %s (port %d): master %s, paired slave%d %s",
+		sl->redundancy == 1 ? "HSR" :
+		(sl->redundancy == 2 ? "PRP" : "Unknown redundancy"),
+		sl->red_port_lanid + 1, sl->iface->name, portnum(sl),
+		sl->red_master_port ?
+			sl->red_master_port->iface->name : "None",
+		sl->red_port_lanid ? 1 : 2,
+		sl->red_pair_port ?
+			sl->red_pair_port->iface->name : "None");
+
+	return 0;
+}
+
+int port_redundancy_setup(struct port *port)
+{
+	int err;
+
+	if (!port->redundancy)
+		return 0;
+
+	/* This is a red port */
+
+	if (port->red_port_lanid >= 0) {
+		/* red slave */
+		err = port_redundancy_slave_setup(port);
+	} else {
+		/* red master */
+		err = port_redundancy_master_setup(port);
+	}
+
+	if (err)
+		pr_err("%s FAIED redundancy setup", port->iface->name);
+
+	return err;
+}
+
 struct port *port_open(int phc_index,
 		       enum timestamp_type timestamping,
 		       int number,
@@ -2828,6 +3517,9 @@ struct port *port_open(int phc_index,
 	struct port *p = malloc(sizeof(*p));
 	enum transport_type transport;
 	int i;
+	int red_sl;
+	char *name;
+	struct interface *iface;
 
 	if (!p) {
 		return NULL;
@@ -2857,6 +3549,32 @@ struct port *port_open(int phc_index,
 	p->state_machine = clock_slave_only(clock) ? ptp_slave_fsm : ptp_fsm;
 	p->phc_index = phc_index;
 	p->jbod = config_get_int(cfg, interface->name, "boundary_clock_jbod");
+	p->redundancy = config_get_int(cfg, interface->name, "redundancy");
+
+	name = config_get_string(cfg, interface->name,
+				 "redundancy_master_interface");
+	if (name) {
+		STAILQ_FOREACH(iface, &cfg->interfaces, list) {
+			if (!strncmp(name, iface->name, MAX_IFNAME_SIZE)) {
+				p->red_master_iface = iface;
+				break;
+			}
+		}
+		if (!p->red_master_iface) {
+			pr_err("Can't find red master interface for %s",
+			       interface->name);
+			goto err_port;
+		}
+	}
+
+	red_sl = config_get_int(cfg, interface->name,
+				"redundancy_slave_number");
+
+	if (red_sl > 0)
+		p->red_port_lanid = red_sl - 1;
+	else
+		p->red_port_lanid = -1;
+
 	transport = config_get_int(cfg, interface->name, "network_transport");
 
 	if (transport == TRANS_UDS) {
@@ -2960,6 +3678,7 @@ struct port *port_open(int phc_index,
 			goto err_tsproc;
 		}
 	}
+
 	return p;
 
 err_tsproc:
@@ -3015,4 +3734,69 @@ int port_state_update(struct port *p, enum fsm_event event, int mdiff)
 	}
 
 	return 0;
+}
+int red_master_port(struct port *p)
+{
+	return red_port(p) && (p->red_port_lanid < 0);
+}
+
+int red_hsr_master_port(struct port *p)
+{
+	return red_hsr_port(p) && (p->red_port_lanid < 0);
+}
+
+int red_prp_master_port(struct port *p)
+{
+	return red_prp_port(p) && (p->red_port_lanid < 0);
+}
+
+int red_slave_port(struct port *p)
+{
+	return red_port(p) && (p->red_port_lanid >= 0);
+}
+
+int red_hsr_slave_port(struct port *p)
+{
+	return red_hsr_port(p) && (p->red_port_lanid >= 0);
+}
+
+int red_prp_slave_port(struct port *p)
+{
+	return red_prp_port(p) && (p->red_port_lanid >= 0);
+}
+
+struct port *port_get_dispatch_port(struct port *p)
+{
+	if (red_master_port(p))
+		return p->red_dispatch_port;
+	else
+		return p;
+}
+
+void port_release_dispatch_port(struct port *orig, struct port *p)
+{
+	if (!red_master_port(orig))
+		return;
+
+	if (orig->red_dispatch_port != p) {
+		pr_warning("release red_dispatch_port %s differ from %s",
+			   orig->red_dispatch_port->name, p->name);
+	}
+
+	orig->red_dispatch_port = NULL;
+}
+
+short port_fault_fd_events(struct port *port)
+{
+	return red_master_port(port) ? 0 : POLLIN|POLLPRI;
+}
+
+char *port_name(struct port *p)
+{
+	return p->name;
+}
+
+int red_port_quality(struct port *port)
+{
+	return port ? port->red_rx_sync_missed : 0;
 }

@@ -327,4 +327,19 @@ void fault_interval(struct port *port, enum fault_type ft,
  */
 void tc_cleanup(void);
 
+/**
+ * @param port        A port instance.
+ */
+int port_redundancy_setup(struct port *port);
+int red_master_port(struct port *port);
+int red_hsr_master_port(struct port *port);
+int red_prp_master_port(struct port *port);
+int red_slave_port(struct port *port);
+int red_hsr_slave_port(struct port *port);
+int red_prp_slave_port(struct port *port);
+int red_port_quality(struct port *port);
+struct port *port_get_dispatch_port(struct port *p);
+void port_release_dispatch_port(struct port *orig, struct port *p);
+char *port_name(struct port *p);
+short port_fault_fd_events(struct port *port);
 #endif
