@@ -281,6 +281,41 @@ int sk_interface_addr(const char *name, int family, struct address *addr)
 	return result;
 }
 
+int sk_set_ts_master_id(const char *name, struct address *addr)
+{
+	struct ethtool_dump dump;
+	struct ifreq ifr;
+	int fd, err;
+	uint8_t mac[MAC_LEN];
+
+	memcpy(mac, &addr->sll.sll_addr, MAC_LEN);
+
+	memset(&ifr, 0, sizeof(ifr));
+	memset(&dump, 0, sizeof(dump));
+	dump.cmd = ETHTOOL_SET_DUMP;
+	dump.version = 0xface;
+	memcpy(&dump.flag, &mac[0], 4);
+	memcpy(&dump.len,  &mac[2], 4);
+	strncpy(ifr.ifr_name, name, IFNAMSIZ - 1);
+	ifr.ifr_data = (char *) &dump;
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+	if (fd < 0) {
+		pr_err("socket failed: %m");
+		goto failed;
+	}
+
+	err = ioctl(fd, SIOCETHTOOL, &ifr);
+	if ((err < 0) && (errno != EOPNOTSUPP)){
+		pr_err("ioctl SIOCETHTOOL failed: %m");
+	}
+
+	close(fd);
+	return err;
+failed:
+	return -1;
+}
+
 static short sk_events = POLLPRI;
 static short sk_revents = POLLPRI;
 
@@ -347,6 +382,127 @@ int sk_receive(int fd, void *buf, int buflen,
 
 	if (addr)
 		addr->len = msg.msg_namelen;
+
+	if (!ts) {
+		memset(&hwts->ts, 0, sizeof(hwts->ts));
+		return cnt;
+	}
+
+	switch (hwts->type) {
+	case TS_SOFTWARE:
+		hwts->ts = timespec_to_tmv(ts[0]);
+		break;
+	case TS_HARDWARE:
+	case TS_ONESTEP:
+	case TS_P2P1STEP:
+		hwts->ts = timespec_to_tmv(ts[2]);
+		break;
+	case TS_LEGACY_HW:
+		hwts->ts = timespec_to_tmv(ts[1]);
+		break;
+	}
+	return cnt;
+}
+
+int sk_red_receive(int fd, void *buf, int buflen,
+		   struct address *addr, struct hw_timestamp *hwts,
+		   struct redundant_info *redinfo,
+		   struct hw_timestamp *red_hwts, int flags)
+{
+	char control[256];
+	int cnt = 0, res = 0, level, type;
+	struct cmsghdr *cm;
+	struct iovec iov = { buf, buflen };
+	struct msghdr msg;
+	struct timespec *sw, *ts = NULL, *rts = NULL;
+
+	memset(control, 0, sizeof(control));
+	memset(&msg, 0, sizeof(msg));
+	if (addr) {
+		msg.msg_name = &addr->ss;
+		msg.msg_namelen = sizeof(addr->ss);
+	}
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+	msg.msg_control = control;
+	msg.msg_controllen = sizeof(control);
+
+	if (flags == MSG_ERRQUEUE) {
+		struct pollfd pfd = { fd, sk_events, 0 };
+		res = poll(&pfd, 1, sk_tx_timeout);
+		if (res < 1) {
+			pr_err(res ? "poll for tx timestamp failed: %m" :
+				     "timed out while polling for tx timestamp");
+			return res;
+		} else if (!(pfd.revents & sk_revents)) {
+			pr_err("poll for tx timestamp woke up on non ERR event");
+			return -1;
+		}
+	}
+
+	cnt = recvmsg(fd, &msg, flags);
+	if (cnt < 1)
+		pr_err("recvmsg%sfailed: %m",
+		       flags == MSG_ERRQUEUE ? " tx timestamp " : " ");
+
+	for (cm = CMSG_FIRSTHDR(&msg); cm != NULL; cm = CMSG_NXTHDR(&msg, cm)) {
+		level = cm->cmsg_level;
+		type  = cm->cmsg_type;
+		if (SOL_SOCKET == level && SO_TIMESTAMPING == type) {
+			if (cm->cmsg_len < sizeof(*ts) * 3) {
+				pr_warning("short SO_TIMESTAMPING message");
+				return -1;
+			}
+			ts = (struct timespec *) CMSG_DATA(cm);
+		}
+		if (SOL_SOCKET == level && SO_TIMESTAMPNS == type) {
+			if (cm->cmsg_len < sizeof(*sw)) {
+				pr_warning("short SO_TIMESTAMPNS message");
+				return -1;
+			}
+			sw = (struct timespec *) CMSG_DATA(cm);
+			hwts->sw = timespec_to_tmv(*sw);
+		}
+		if (SOL_SOCKET == level && SO_REDUNDANT == type) {
+			struct redundant_info *red;
+
+			if (cm->cmsg_len < sizeof(*red)) {
+				pr_warning("short SO_REDUNDANT message");
+				return -1;
+			}
+
+			red = (struct redundant_info *) CMSG_DATA(cm);
+			memcpy(redinfo, red, sizeof(*redinfo));
+		}
+		if (SOL_SOCKET == level && SO_RED_TIMESTAMPING == type) {
+			if (cm->cmsg_len < sizeof(*rts) * 3) {
+				pr_warning("short SO_TIMESTAMPING message");
+				return -1;
+			}
+			rts = (struct timespec *) CMSG_DATA(cm);
+		}
+	}
+
+	if (addr)
+		addr->len = msg.msg_namelen;
+
+	if (red_hwts && rts) {
+		memset(&red_hwts->ts, 0, sizeof(red_hwts->ts));
+
+		switch (red_hwts->type) {
+		case TS_SOFTWARE:
+			red_hwts->ts = timespec_to_tmv(rts[0]);
+			break;
+		case TS_HARDWARE:
+		case TS_ONESTEP:
+		case TS_P2P1STEP:
+			red_hwts->ts = timespec_to_tmv(rts[2]);
+			break;
+		case TS_LEGACY_HW:
+			red_hwts->ts = timespec_to_tmv(rts[1]);
+			break;
+		}
+	}
 
 	if (!ts) {
 		memset(&hwts->ts, 0, sizeof(hwts->ts));

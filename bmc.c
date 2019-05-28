@@ -21,7 +21,12 @@
 #include "bmc.h"
 #include "ds.h"
 
-int dscmp2(struct dataset *a, struct dataset *b)
+#define A_BETTER_TOPO  2
+#define A_BETTER       1
+#define B_BETTER      -1
+#define B_BETTER_TOPO -2
+
+int dscmp2(struct dataset *a, struct dataset *b, int a_qual, int b_qual)
 {
 	int diff;
 	unsigned int A = a->stepsRemoved, B = b->stepsRemoved;
@@ -53,6 +58,15 @@ int dscmp2(struct dataset *a, struct dataset *b)
 		return 0;
 	}
 
+	/* For redundancy, compare quality of A and B if available
+	 * returns A_BETTER_TOPO or B_BETTER_TOPO.
+	 * See IEC-62439-3-2016 A.7.3. p114.
+	 */
+	if (a_qual < b_qual)
+		return A_BETTER_TOPO;
+	if (a_qual > b_qual)
+		return B_BETTER_TOPO;
+
 	diff = memcmp(&a->sender, &b->sender, sizeof(a->sender));
 	if (diff < 0)
 		return A_BETTER_TOPO;
@@ -69,7 +83,7 @@ int dscmp2(struct dataset *a, struct dataset *b)
 	return 0;
 }
 
-int dscmp(struct dataset *a, struct dataset *b)
+int dscmp(struct dataset *a, struct dataset *b, int a_qual, int b_qual)
 {
 	int diff;
 
@@ -83,7 +97,7 @@ int dscmp(struct dataset *a, struct dataset *b)
 	diff = memcmp(&a->identity, &b->identity, sizeof(a->identity));
 
 	if (!diff)
-		return dscmp2(a, b);
+		return dscmp2(a, b, a_qual, b_qual);
 
 	if (a->priority1 < b->priority1)
 		return A_BETTER;
@@ -116,28 +130,35 @@ int dscmp(struct dataset *a, struct dataset *b)
 }
 
 enum port_state bmc_state_decision(struct clock *c, struct port *r,
-				   int (*compare)(struct dataset *a, struct dataset *b))
+				   int (*compare)(struct dataset *a, struct dataset *b, int a_qual, int b_qual))
 {
 	struct dataset *clock_ds, *clock_best, *port_best;
 	enum port_state ps;
+	int res;
+	int best_fc_port_qual = 0, port_qual = 0;
 
 	clock_ds = clock_default_ds(c);
 	clock_best = clock_best_foreign(c);
+	best_fc_port_qual = red_port_quality(clock_best_port(c));
 	port_best = port_best_foreign(r);
+	port_qual = red_port_quality(r);
 	ps = port_state(r);
+
+	if (ps == PS_FAULTY)
+		return ps;
 
 	if (!port_best && PS_LISTENING == ps)
 		return ps;
 
 	if (clock_class(c) <= 127) {
-		if (compare(clock_ds, port_best) > 0) {
+		if (compare(clock_ds, port_best, 0, 0) > 0) {
 			return PS_GRAND_MASTER; /*M1*/
 		} else {
 			return PS_PASSIVE; /*P1*/
 		}
 	}
 
-	if (compare(clock_ds, clock_best) > 0) {
+	if (compare(clock_ds, clock_best, 0, 0) > 0) {
 		return PS_GRAND_MASTER; /*M2*/
 	}
 
@@ -145,7 +166,18 @@ enum port_state bmc_state_decision(struct clock *c, struct port *r,
 		return PS_SLAVE; /*S1*/
 	}
 
-	if (compare(clock_best, port_best) == A_BETTER_TOPO) {
+	if (red_slave_port(r) &&
+	    (red_get_master_port(r) ==
+	     red_get_master_port(clock_best_port(c)))) {
+		/* clock best is not on this port, if it is a redundancy port
+		 * and its master port is the clock master, then this port
+		 * should be PSLAVE
+		 */
+		return PS_PASSIVE_SLAVE;
+	}
+
+	res = dscmp(clock_best, port_best, best_fc_port_qual, port_qual);
+	if (res == A_BETTER_TOPO) {
 		return PS_PASSIVE; /*P2*/
 	} else {
 		return PS_MASTER; /*M3*/

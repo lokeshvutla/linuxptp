@@ -82,6 +82,7 @@ struct clock {
 	int sync_offset;
 	int leap_set;
 	int utc_offset_set;
+	int dup_phc;
 	struct servo *servo;
 	enum servo_state servo_state;
 	char *device;
@@ -96,6 +97,7 @@ struct port {
 	LIST_ENTRY(port) list;
 	unsigned int number;
 	int state;
+	int pps_offset;
 	struct clock *clock;
 };
 
@@ -120,6 +122,10 @@ struct node {
 	LIST_HEAD(clock_head, clock) clocks;
 	LIST_HEAD(dst_clock_head, clock) dst_clocks;
 	struct clock *master;
+	int sync_type;
+	char *gmac_iface;
+	int use_extts_sync;
+	struct clock *extts_last_master;
 };
 
 static struct config *phc2sys_config;
@@ -133,7 +139,8 @@ static void run_pmc_events(struct node *node);
 static int normalize_state(int state);
 static int run_pmc_port_properties(struct node *node, int timeout,
 				   unsigned int port,
-				   int *state, int *tstamping, char *iface);
+				   int *state, int *tstamping, char *iface,
+				   int *pps_offset);
 
 static clockid_t clock_open(char *device, int *phc_index)
 {
@@ -357,7 +364,7 @@ static void clock_reinit(struct node *node, struct clock *clock, int new_state)
 		if (p->clock == clock) {
 			ret = run_pmc_port_properties(node, 1000, p->number,
 					              &state, &timestamping,
-						      iface);
+						      iface, NULL);
 			if (ret > 0)
 				p->state = normalize_state(state);
 		}
@@ -412,6 +419,14 @@ static struct clock *find_dst_clock(struct node *node, int phc_index) {
 	return c;
 }
 
+static inline void node_set_master(struct node *n, struct clock *c)
+{
+	n->master = c;
+	/* Reset to original state in next reconfiguration. */
+	n->master->new_state = c->state;
+	n->master->state = PS_SLAVE;
+}
+
 static void reconfigure(struct node *node)
 {
 	struct clock *c, *rt = NULL, *src = NULL, *last = NULL, *dup = NULL;
@@ -424,9 +439,14 @@ static void reconfigure(struct node *node)
 		LIST_REMOVE(node->dst_clocks.lh_first, dst_list);
 	}
 
+	if (node->use_extts_sync)
+		node->extts_last_master = node->master;
+
 	LIST_FOREACH(c, &node->clocks, list) {
 		if (c->clkid == CLOCK_REALTIME) {
 			rt = c;
+			LIST_INSERT_HEAD(&node->dst_clocks,
+					 c, dst_list);
 			continue;
 		}
 
@@ -443,6 +463,7 @@ static void reconfigure(struct node *node)
 		case PS_PRE_MASTER:
 		case PS_MASTER:
 		case PS_PASSIVE:
+		        c->dup_phc = FALSE;
 			dup = find_dst_clock(node, c->phc_index);
 			if (!dup) {
 				pr_info("selecting %s for synchronization",
@@ -451,6 +472,7 @@ static void reconfigure(struct node *node)
 				LIST_INSERT_HEAD(&node->dst_clocks,
 						 c, dst_list);
 			} else {
+				c->dup_phc = TRUE;
 				pr_info("skipping %s: %s has the same clock "
 					"and is already selected",
 					c->device, dup->device);
@@ -468,6 +490,9 @@ static void reconfigure(struct node *node)
 	}
 	if (dst_cnt > 1 && !src) {
 		if (!rt || rt->dest_only) {
+			if (node->extts_last_master)
+				last = node->extts_last_master;
+
 			node->master = last;
 			/* Reset to original state in next reconfiguration. */
 			node->master->new_state = node->master->state;
@@ -480,24 +505,48 @@ static void reconfigure(struct node *node)
 		}
 	}
 	if (src_cnt > 1) {
-		pr_info("multiple master clocks available, postponing sync...");
-		node->master = NULL;
+		if (node->extts_last_master) {
+			pr_info("multiple master clks, continue to use %s",
+				node->extts_last_master->device);
+			node_set_master(node, node->extts_last_master);
+		} else {
+			pr_info("multiple master clocks available, postponing sync...");
+			node->master = NULL;
+		}
 		return;
 	}
 	if (src_cnt > 0 && !src) {
-		pr_info("master clock not ready, waiting...");
-		node->master = NULL;
+		if (node->extts_last_master) {
+			pr_info("master clk not ready, continue to use %sk",
+				node->extts_last_master->device);
+			node_set_master(node, node->extts_last_master);
+		} else {
+			pr_info("master clock not ready, waiting...");
+			node->master = NULL;
+		}
 		return;
 	}
 	if (!src_cnt && !dst_cnt) {
-		pr_info("no PHC ready, waiting...");
-		node->master = NULL;
+		if (node->extts_last_master) {
+			pr_info("no PHC ready, continue to use %s",
+				node->extts_last_master->device);
+			node_set_master(node, node->extts_last_master);
+		} else {
+			pr_info("no PHC ready, waiting...");
+			node->master = NULL;
+		}
 		return;
 	}
 	if ((!src_cnt && (!rt || rt->dest_only)) ||
 	    (!dst_cnt && !rt)) {
-		pr_info("nothing to synchronize");
-		node->master = NULL;
+		if (node->extts_last_master) {
+			pr_info("nothing to synchronize, continue to use %s",
+				node->extts_last_master->device);
+			node_set_master(node, node->extts_last_master);
+		} else {
+			pr_info("nothing to synchronize");
+			node->master = NULL;
+		}
 		return;
 	}
 	if (!src_cnt) {
@@ -644,14 +693,26 @@ static void update_clock(struct node *node, struct clock *clock,
 	}
 }
 
-static void enable_pps_output(clockid_t src)
+static void pps_output_control(clockid_t src, int enable)
 {
-	int enable = 1;
-
-	if (!phc_has_pps(src))
+	if (!phc_has_pps(src)) {
+		pr_warning("src clk %d does not have pps", src);
 		return;
+	}
 	if (ioctl(CLOCKID_TO_FD(src), PTP_ENABLE_PPS, enable) < 0)
 		pr_warning("failed to enable PPS output");
+}
+
+static void set_pps_offset(clockid_t src, int offset)
+{
+	if (!phc_has_pps(src)) {
+		pr_warning("src clk %d does not have pps", src);
+		return;
+	}
+
+	pr_info("set_pps_offset(%d): offset = %d", src, offset);
+	if (ioctl(CLOCKID_TO_FD(src), PTP_PPS_OFFSET, offset) < 0)
+		pr_warning("failed to set PPS offset");
 }
 
 static int read_pps(int fd, int64_t *offset, uint64_t *ts)
@@ -688,7 +749,7 @@ static int do_pps_loop(struct node *node, struct clock *clock, int fd)
 		/* The sync offset can't be applied with PPS alone. */
 		node->sync_offset = 0;
 	} else {
-		enable_pps_output(node->master->clkid);
+		pps_output_control(node->master->clkid, 1);
 	}
 
 	while (is_running()) {
@@ -800,6 +861,343 @@ static int do_loop(struct node *node, int subscriptions)
 			update_clock(node, clock, offset, ts, delay);
 		}
 	}
+	return 0;
+}
+
+static int read_extts(int fd, int64_t *offset, uint64_t *ts, int extts_idx)
+{
+	struct ptp_extts_event event;
+	int cnt;
+
+	cnt = read(fd, &event, sizeof(event));
+	if (cnt != sizeof(event)) {
+		pr_err("failed to read extts: %m");
+		return 0;
+	}
+
+	if(event.index != (unsigned int)extts_idx) {
+		pr_info("unexpected extts index %u, expecting %d:",
+			event.index, extts_idx);
+		return 0;
+	}
+
+	*ts = event.t.sec * NS_PER_SEC;
+	*ts += event.t.nsec;
+
+	*offset = *ts % NS_PER_SEC;
+	if (*offset > NS_PER_SEC / 2) {
+		*offset -= NS_PER_SEC;
+		*ts += NS_PER_SEC;
+	}
+
+	return 1;
+}
+
+static int extts_input_control(struct clock *clock, int extts_idx, int enable)
+{
+	struct ptp_extts_request extts_request;
+	clockid_t clkid = clock->clkid;
+
+	memset(&extts_request, 0, sizeof(extts_request));
+	extts_request.index = extts_idx;
+
+	if (enable)
+		extts_request.flags = PTP_ENABLE_FEATURE;
+
+	if (ioctl(CLOCKID_TO_FD(clkid), PTP_EXTTS_REQUEST, &extts_request)) {
+		pr_warning("%s: failed to %sable extts",
+			   clock->device, (enable ? "en" : "dis"));
+			return -1;
+	}
+
+	return 0;
+}
+
+static int do_extts_loop(struct node *node, struct clock *clock, int extts_idx)
+{
+	int64_t extts_offset, extts_offset_upd;
+	uint64_t extts_ts;
+	int64_t sc_offset, delay;
+	uint64_t sc_ts, mc_ts;
+	clockid_t mc_id = node->master->clkid;
+	clockid_t sc_id = clock->clkid;
+	int err;
+
+	node->master->source_label = "extts_src";
+
+	if (mc_id == CLOCK_INVALID) {
+		/* The sync offset can't be applied with PPS alone. */
+		node->sync_offset = 0;
+	} else {
+		pps_output_control(mc_id, 1);
+		err = extts_input_control(clock, extts_idx, 1);
+		if (err)
+			return err;
+	}
+
+	while (is_running()) {
+		if (!read_extts(CLOCKID_TO_FD(sc_id), &extts_offset,
+				&extts_ts, extts_idx))
+			continue;
+
+		if (update_pmc(node, 0) < 0)
+			continue;
+
+		/* If a master PHC is available, use it to get the whole number
+		   of seconds in the offset and PPS for the rest. */
+		if (mc_id != CLOCK_INVALID) {
+			if (!read_phc(mc_id, sc_id, node->phc_readings,
+				      &sc_offset, &sc_ts, &delay))
+				return -1;
+
+			mc_ts = sc_ts - sc_offset;
+			mc_ts = mc_ts / NS_PER_SEC * NS_PER_SEC;
+			extts_offset_upd = extts_ts - mc_ts;
+		}
+
+		update_clock(node, clock, extts_offset_upd, extts_ts, -1);
+	}
+
+	pps_output_control(mc_id, 0);
+	extts_input_control(clock, extts_idx, 0);
+	close(CLOCKID_TO_FD(sc_id));
+	return 0;
+}
+
+#define DEFAULT_EXTTS_IDX 0
+#define CPTS_EXTTS_IDX 2
+
+#define IS_CPTS_CLOCK(n, c) \
+	((n)->gmac_iface && !strcmp((n)->gmac_iface, (c)->device))
+
+#define CLK_EXTTS_IDX(n, c) \
+	(IS_CPTS_CLOCK(n, c) ? CPTS_EXTTS_IDX : DEFAULT_EXTTS_IDX)
+
+static void autocfg_extts_clock_settime(struct node *node,
+					clockid_t src_id, clockid_t dst_id)
+{
+	int64_t dst_offset, delay, adj_sec;
+	uint64_t dst_ts;
+	int neg = 0;
+
+	if (!read_phc(src_id, dst_id, node->phc_readings,
+		      &dst_offset, &dst_ts, &delay)){
+		pr_info("read_phc(%d, %d) failed", src_id, dst_id);
+		return;
+	}
+
+	if (dst_offset < 0) {
+		/* need a positive adj to bring dst clock
+		 * to the same SEC as the src clock.
+		 */
+		adj_sec = -dst_offset;
+	} else {
+		neg = 1;
+		adj_sec = dst_offset;
+	}
+
+	adj_sec = (adj_sec / NS_PER_SEC) * NS_PER_SEC;
+	if (!adj_sec)
+		return;
+
+	if (neg)
+		adj_sec = -adj_sec;
+
+	clockadj_step(dst_id, adj_sec);
+}
+
+static int autocfg_extts_init_clocks(struct node *node)
+{
+	struct node *n = node;
+	struct clock *clock;
+	struct clock *cpts = NULL;
+	clockid_t master_clkid;
+
+	int64_t extts_offset;
+	uint64_t extts_ts;
+	int i;
+
+	if (!node->master)
+		return 0;
+
+	master_clkid = node->master->clkid;
+
+	/* disable pps output and latch on all clocks */
+	LIST_FOREACH(clock, &node->clocks, list) {
+		if (clock->clkid == CLOCK_REALTIME)
+			continue;
+
+		if (clock->dup_phc)
+			continue;
+
+		pps_output_control(clock->clkid, 0);
+		extts_input_control(clock, CLK_EXTTS_IDX(n, clock), 0);
+
+		if (IS_CPTS_CLOCK(n, clock))
+			cpts = clock;
+
+	}
+
+	/* enable pps output on master clock */
+	pps_output_control(master_clkid, 1);
+
+	if (IS_CPTS_CLOCK(n, node->master)) {
+		/* enable extts input on all slave clocks */
+		LIST_FOREACH(clock, &node->clocks, list) {
+			if (clock->clkid == master_clkid)
+				continue;
+
+			if (clock->clkid == CLOCK_REALTIME)
+				continue;
+
+			if (clock->state == PS_UNCALIBRATED)
+				continue;
+
+			if (clock->dup_phc)
+				continue;
+
+			autocfg_extts_clock_settime(node,
+						    master_clkid,
+						    clock->clkid);
+
+			extts_input_control(clock,
+					   CLK_EXTTS_IDX(n, clock), 1);
+		}
+
+		return 0;
+	}
+
+	/* Now cpts is not the master clk. But it may not even exist.
+	 * If it does exist, make sure it is ready first.
+	 */
+	if (cpts && cpts->state != PS_UNCALIBRATED) {
+		extts_input_control(cpts, CLK_EXTTS_IDX(n, cpts), 1);
+		for (i = 0; i < 2; i++) {
+			if (!read_extts(CLOCKID_TO_FD(cpts->clkid),
+					&extts_offset,
+					&extts_ts, CLK_EXTTS_IDX(n, cpts))) {
+				pr_info("%s read_extts failed", cpts->device);
+				return -1;
+			}
+		}
+
+		autocfg_extts_clock_settime(node, master_clkid,
+					    cpts->clkid);
+	}
+
+	/* Get the other clocks ready. */
+	LIST_FOREACH(clock, &node->clocks, list) {
+		/* don't try to init the clock to itself */
+		if (clock->clkid == master_clkid ||
+		    (clock->phc_index >= 0 &&
+		     clock->phc_index == node->master->phc_index) ||
+		    !strcmp(clock->device, node->master->device))
+			continue;
+
+		if (cpts && clock->clkid == cpts->clkid)
+			continue;
+
+		if (clock->clkid == CLOCK_REALTIME)
+			continue;
+
+		if (clock->state == PS_UNCALIBRATED)
+			continue;
+
+		if (clock->dup_phc)
+			continue;
+
+		autocfg_extts_clock_settime(node, master_clkid,
+					    clock->clkid);
+
+		extts_input_control(clock, CLK_EXTTS_IDX(n, clock), 1);
+	}
+
+	return 0;
+}
+
+static int do_autocfg_extts_loop(struct node *node, int subscriptions)
+{
+	struct node *n = node;
+	struct clock *clock;
+	int64_t extts_offset;
+	uint64_t extts_ts;
+	uint64_t ts;
+	int64_t offset, delay;
+	int ret;
+
+	while (is_running()) {
+		if (update_pmc(node, subscriptions) < 0)
+			continue;
+
+		if (subscriptions) {
+			run_pmc_events(node);
+			if (node->state_changed) {
+				/* force getting offset, as it may have
+				 * changed after the port state change */
+				if (run_pmc_get_utc_offset(node, 1000) <= 0) {
+					pr_err("failed to get UTC offset");
+					continue;
+				}
+				reconfigure(node);
+				if (node->master) {
+					ret = autocfg_extts_init_clocks(node);
+					if (ret < 0) {
+						pr_err("autocfg_extts_init_clocks failed ");
+						return ret;
+					}
+				}
+			}
+		}
+		if (!node->master)
+			continue;
+
+		LIST_FOREACH(clock, &node->dst_clocks, dst_list) {
+			if (!update_needed(clock))
+				continue;
+
+			/* don't try to synchronize the clock to itself */
+			if (clock->clkid == node->master->clkid ||
+			    (clock->phc_index >= 0 &&
+			     clock->phc_index == node->master->phc_index) ||
+			    !strcmp(clock->device, node->master->device))
+				continue;
+
+			/* Process RT clock */
+			if (clock->clkid == CLOCK_REALTIME) {
+				/* use phc */
+				if (read_phc(node->master->clkid, clock->clkid,
+				             node->phc_readings,
+				             &offset, &ts, &delay)) {
+					update_clock(node, clock, offset, ts, delay);
+				}
+				continue;
+			}
+
+			if (clock->state == PS_UNCALIBRATED)
+				continue;
+
+			if (!read_extts(CLOCKID_TO_FD(clock->clkid),
+					&extts_offset,
+					&extts_ts, CLK_EXTTS_IDX(n, clock)))
+				continue;
+
+			update_clock(node, clock, extts_offset, extts_ts, -1);
+
+			autocfg_extts_clock_settime(node, node->master->clkid,
+						    clock->clkid);
+
+		}
+	}
+
+	LIST_FOREACH(clock, &node->clocks, list) {
+		if ((clock->clkid != CLOCK_REALTIME) &&
+		    (!clock->dup_phc)) {
+			pps_output_control(clock->clkid, 0);
+			extts_input_control(clock, CLK_EXTTS_IDX(n, clock), 0);
+		}
+		close(CLOCKID_TO_FD(clock->clkid));
+	}
+
 	return 0;
 }
 
@@ -1108,7 +1506,8 @@ static void run_pmc_events(struct node *node)
 
 static int run_pmc_port_properties(struct node *node, int timeout,
 				   unsigned int port,
-				   int *state, int *tstamping, char *iface)
+				   int *state, int *tstamping, char *iface,
+				   int *pps_offset)
 {
 	struct ptp_message *msg;
 	int res, len;
@@ -1128,6 +1527,8 @@ static int run_pmc_port_properties(struct node *node, int timeout,
 
 		*state = ppn->port_state;
 		*tstamping = ppn->timestamping;
+		if (pps_offset)
+			*pps_offset = ppn->pps_offset;
 		len = ppn->interface.length;
 		if (len > IFNAMSIZ - 1)
 			len = IFNAMSIZ - 1;
@@ -1173,7 +1574,7 @@ static int auto_init_ports(struct node *node, int add_rt)
 	struct clock *clock;
 	int number_ports, res;
 	unsigned int i;
-	int state, timestamping;
+	int state, timestamping, pps_offset;
 	char iface[IFNAMSIZ];
 
 	while (1) {
@@ -1202,7 +1603,8 @@ static int auto_init_ports(struct node *node, int add_rt)
 
 	for (i = 1; i <= number_ports; i++) {
 		res = run_pmc_port_properties(node, 1000, i, &state,
-					      &timestamping, iface);
+					      &timestamping, iface,
+					      &pps_offset);
 		if (res == -1) {
 			/* port does not exist, ignore the port */
 			continue;
@@ -1219,6 +1621,10 @@ static int auto_init_ports(struct node *node, int add_rt)
 		if (!port)
 			return -1;
 		port->state = normalize_state(state);
+
+		if (port->clock)
+			set_pps_offset(port->clock->clkid, pps_offset);
+
 	}
 	if (LIST_EMPTY(&node->clocks)) {
 		pr_err("no suitable ports available");
@@ -1336,7 +1742,10 @@ static void usage(char *progname)
 		" -a             turn on autoconfiguration\n"
 		" -r             synchronize system (realtime) clock\n"
 		"                repeat -r to consider it also as a time source\n"
+		" -X             use pps between phc's to sync\n"
+		" -g [iface]     interface that is gmac port (eth0)\n"
 		" manual configuration:\n"
+		" -e [num]       slave clock extts idx\n"
 		" -c [dev|name]  slave clock (CLOCK_REALTIME)\n"
 		" -d [dev]       master PPS device\n"
 		" -s [dev|name]  master clock\n"
@@ -1375,10 +1784,12 @@ int main(int argc, char *argv[])
 	struct option *opts;
 	int autocfg = 0, c, domain_number = 0, index, ntpshm_segment;
 	int pps_fd = -1, print_level = LOG_INFO, r = -1, rt = 0, wait_sync = 0;
+	int extts_idx = -1;
 	double phc_rate, tmp;
 	struct node node = {
 		.phc_readings = 5,
 		.phc_interval = 1.0,
+		.gmac_iface = NULL,
 	};
 
 	handle_term_signals();
@@ -1397,7 +1808,7 @@ int main(int argc, char *argv[])
 	progname = strrchr(argv[0], '/');
 	progname = progname ? 1+progname : argv[0];
 	while (EOF != (c = getopt_long(argc, argv,
-				"arc:d:f:s:E:P:I:S:F:R:N:O:L:M:i:u:wn:xz:l:t:mqvh",
+				"arXc:g:e:d:f:s:E:P:I:S:F:R:N:O:L:M:i:u:wn:xz:l:t:mqvh",
 				opts, &index))) {
 		switch (c) {
 		case 0:
@@ -1411,8 +1822,18 @@ int main(int argc, char *argv[])
 		case 'r':
 			rt++;
 			break;
+		case 'X':
+			node.use_extts_sync = 1;
+			break;
 		case 'c':
 			dst_name = strdup(optarg);
+			break;
+		case 'g':
+			node.gmac_iface = strdup(optarg);
+			break;
+		case 'e':
+			if (get_arg_val_i(c, optarg, &extts_idx, 0, INT_MAX))
+				goto end;
 			break;
 		case 'd':
 			pps_fd = open(optarg, O_RDONLY);
@@ -1567,9 +1988,16 @@ int main(int argc, char *argv[])
 			"autoconfiguration cannot be mixed with manual config options.\n");
 		goto bad_usage;
 	}
+
 	if (!autocfg && pps_fd < 0 && !src_name) {
 		fprintf(stderr,
 			"autoconfiguration or valid source clock must be selected.\n");
+		goto bad_usage;
+	}
+
+	if (!autocfg && extts_idx >= 0 && (!src_name || !dst_name)) {
+		fprintf(stderr,
+			"autoconfiguration or valid source and destination clock must be selected when using extts sync.\n");
 		goto bad_usage;
 	}
 
@@ -1601,9 +2029,19 @@ int main(int argc, char *argv[])
 	if (autocfg) {
 		if (init_pmc(cfg, &node))
 			goto end;
-		if (auto_init_ports(&node, rt) < 0)
-			goto end;
-		r = do_loop(&node, 1);
+		if (!node.use_extts_sync) {
+			if (auto_init_ports(&node, rt) < 0)
+				goto end;
+			r = do_loop(&node, 1);
+		} else {
+			if (auto_init_ports(&node, rt) < 0)
+				goto end;
+
+			node.extts_last_master = NULL;
+			r = do_autocfg_extts_loop(&node, 1);
+		}
+		if (node.gmac_iface)
+			free(node.gmac_iface);
 		goto end;
 	}
 
@@ -1630,6 +2068,13 @@ int main(int argc, char *argv[])
 	if (pps_fd >= 0 && dst->clkid != CLOCK_REALTIME) {
 		fprintf(stderr,
 			"cannot use a pps device unless destination is CLOCK_REALTIME\n");
+		goto bad_usage;
+	}
+
+	if (extts_idx >= 0 && (src->clkid == CLOCK_REALTIME || dst->clkid == CLOCK_REALTIME)) {
+		/* pps_fd is the extts_dev of dst clk */
+		fprintf(stderr,
+			"cannot use extts sync unless neither source nor destination is CLOCK_REALTIME\n");
 		goto bad_usage;
 	}
 
@@ -1668,6 +2113,9 @@ int main(int argc, char *argv[])
 		 * implement a mean to specify PTP port to PPS mapping */
 		servo_sync_interval(dst->servo, 1.0);
 		r = do_pps_loop(&node, dst, pps_fd);
+	} else if (extts_idx >= 0) {
+		servo_sync_interval(dst->servo, 1.0);
+		r = do_extts_loop(&node, dst, extts_idx);
 	} else {
 		r = do_loop(&node, 0);
 	}

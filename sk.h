@@ -99,6 +99,11 @@ int sk_interface_addr(const char *name, int family, struct address *addr);
 int sk_receive(int fd, void *buf, int buflen,
 	       struct address *addr, struct hw_timestamp *hwts, int flags);
 
+int sk_red_receive(int fd, void *buf, int buflen,
+		   struct address *addr, struct hw_timestamp *hwts,
+		   struct redundant_info *redinfo,
+		   struct hw_timestamp *red_hwts, int flags);
+
 /**
  * Set DSCP value for socket.
  * @param fd    An open socket.
@@ -131,4 +136,5 @@ extern int sk_tx_timeout;
  */
 extern int sk_check_fupsync;
 
+int sk_set_ts_master_id(const char *name, struct address *addr);
 #endif

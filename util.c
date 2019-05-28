@@ -46,6 +46,7 @@ const char *ps_str[] = {
 	"PASSIVE",
 	"UNCALIBRATED",
 	"SLAVE",
+	"PASSIVE_SLAVE",
 	"GRAND_MASTER",
 };
 
@@ -67,6 +68,8 @@ const char *ev_str[] = {
 	"RS_GRAND_MASTER",
 	"RS_SLAVE",
 	"RS_PASSIVE",
+	"RS_PSLAVE",
+	"SYNC_RECEIPT_TIMEOUT_EXPIRES",
 };
 
 int addreq(enum transport_type type, struct address *a, struct address *b)

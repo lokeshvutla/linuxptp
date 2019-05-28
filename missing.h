@@ -75,6 +75,10 @@ enum {
 #define SO_SELECT_ERR_QUEUE 45
 #endif
 
+#ifndef PTP_PPS_OFFSET
+#define PTP_PPS_OFFSET     _IOW('=', 9, int)
+#endif
+
 #ifndef HAVE_CLOCK_ADJTIME
 static inline int clock_adjtime(clockid_t id, struct timex *tx)
 {
@@ -152,6 +156,42 @@ static inline int timerfd_settime(int fd, int flags,
 #else /*__UCLIBC__*/
 
 #include <sys/timerfd.h>
+
+#define BIT(nr)              (1 << (nr))
+
+#ifndef SO_REDUNDANT
+#define SO_REDUNDANT         80
+#define SCM_REDUNDANT        SO_REDUNDANT
+#endif
+
+#ifndef SO_RED_TIMESTAMPING
+#define SO_RED_TIMESTAMPING  81
+#define SCM_RED_TIMESTAMPING SO_RED_TIMESTAMPING
+#endif
+
+#define PTP_MSG_IN           (0x3 << 6)
+#define PTP_EVT_OUT          (0x2 << 6)
+#define DIRECTED_TX          (0x1 << 6)
+#define RED_PORT_B           BIT(1)
+#define RED_PORT_A           BIT(0)
+
+#define MSG_REDINFO(m)       (&(m)->redinfo)
+#define MSG_HWTS(m)          (&(m)->hwts.ts)
+#define MSG_RED_HWTS(m)      (&(m)->red_hwts.ts)
+#define MSG_REDINFO_B(m)     (&(m)->redinfo_b)
+#define MSG_HWTS_B(m)        (&(m)->hwts_b.ts)
+#define MSG_RED_HWTS_B(m)    (&(m)->red_hwts_b.ts)
+
+#define REDINFO_T(r)         ((r)->io_port & (0x3 << 6))
+#define REDINFO_PORTS(r)     ((r)->io_port & 0x3)
+#define REDINFO_PATHID(r)    ((r)->pathid)
+#define REDINFO_SEQNR(r)     ((r)->seqnr)
+
+#define MSG_RED_PORTS(m)  (REDINFO_PORTS(MSG_REDINFO(m)))
+#define MSG_RED_T(m)      (REDINFO_T(MSG_REDINFO(m)))
+#define IS_PTP_MSG_IN(r)  (REDINFO_T(r) == PTP_MSG_IN)
+#define IS_PTP_EVT_OUT(r) (REDINFO_T(r) == PTP_EVT_OUT)
+#define IS_PTP_DIR_OUT(r) (REDINFO_T(r) == DIRECTED_TX)
 
 #endif
 

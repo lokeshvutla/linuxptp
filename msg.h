@@ -71,6 +71,14 @@ struct hw_timestamp {
 	tmv_t sw;
 };
 
+struct redundant_info {
+	uint8_t  io_port;     /* tx/rx port of the skb */
+	uint8_t  pathid;      /* pathid in tag */
+	uint16_t ethertype;   /* ethertype in tag */
+	uint16_t lsdu_size;   /* lsdu size in tag */
+	uint16_t seqnr;       /* seqnr in tag */
+};
+
 enum controlField {
 	CTL_SYNC,
 	CTL_DELAY_REQ,
@@ -219,6 +227,12 @@ struct ptp_message {
 	 */
 	struct hw_timestamp hwts;
 	/**
+	 * Contains hsr/prp tag info
+	 */
+	struct redundant_info redinfo;
+	struct hw_timestamp red_hwts;
+
+	/**
 	 * Contains the address this message was received from or should be
 	 * sent to.
 	 */
@@ -354,6 +368,8 @@ void msg_get(struct ptp_message *m);
  */
 int msg_post_recv(struct ptp_message *m, int cnt);
 
+int msg_post_red_recv(struct ptp_message *m);
+
 /**
  * Prepare messages for transmission.
  * @param m  A message obtained using @ref msg_allocate().
@@ -387,6 +403,7 @@ void msg_put(struct ptp_message *m);
  * @return   One if the message is an event without a time stamp, zero otherwise.
  */
 int msg_sots_missing(struct ptp_message *m);
+int msg_red_sots_missing(struct ptp_message *m);
 
 /**
  * Test whether a message has a valid SO_TIMESTAMPING time stamp.
@@ -406,6 +423,16 @@ static inline int msg_sots_valid(struct ptp_message *m)
 static inline Boolean msg_unicast(struct ptp_message *m)
 {
 	return field_is_set(m, 0, UNICAST);
+}
+
+static inline int ts_valid(tmv_t *ts)
+{
+	return (ts->ns) ? 1 : 0;
+}
+
+static inline int msg_red_sots_valid(struct ptp_message *m)
+{
+	return ts_valid(&m->red_hwts.ts);
 }
 
 /**

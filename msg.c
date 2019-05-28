@@ -429,6 +429,18 @@ int msg_post_recv(struct ptp_message *m, int cnt)
 	return 0;
 }
 
+int msg_post_red_recv(struct ptp_message *m)
+{
+	if (msg_type(m) != SYNC)
+		return 0;
+
+	/* Check cut-through tx timestamp */
+	if (msg_red_sots_missing(m))
+		return -ETIME;
+
+	return 0;
+}
+
 int msg_pre_send(struct ptp_message *m)
 {
 	int type;
@@ -600,4 +612,13 @@ int msg_sots_missing(struct ptp_message *m)
 		return 0;
 	}
 	return msg_sots_valid(m) ? 0 : 1;
+}
+
+/* For cut-through tx timestamp */
+int msg_red_sots_missing(struct ptp_message *m)
+{
+	if (msg_type(m) != SYNC)
+		return 0;
+
+	return msg_red_sots_valid(m) ? 0 : 1;
 }
