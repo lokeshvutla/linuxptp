@@ -885,7 +885,6 @@ static int read_extts(int fd, int64_t *offset, uint64_t *ts, int extts_idx)
 	*offset = *ts % NS_PER_SEC;
 	if (*offset > NS_PER_SEC / 2) {
 		*offset -= NS_PER_SEC;
-		*ts += NS_PER_SEC;
 	}
 
 	return 1;
@@ -971,10 +970,11 @@ static int do_extts_loop(struct node *node, struct clock *clock, int extts_idx)
 #define CLK_EXTTS_IDX(n, c) \
 	(IS_CPTS_CLOCK(n, c) ? CPTS_EXTTS_IDX : DEFAULT_EXTTS_IDX)
 
+
 static void autocfg_extts_clock_settime(struct node *node,
 					clockid_t src_id, clockid_t dst_id)
 {
-	int64_t dst_offset, delay, adj_sec;
+	int64_t dst_offset, delay;
 	uint64_t dst_ts;
 	int neg = 0;
 
@@ -988,21 +988,23 @@ static void autocfg_extts_clock_settime(struct node *node,
 		/* need a positive adj to bring dst clock
 		 * to the same SEC as the src clock.
 		 */
-		adj_sec = -dst_offset;
+		dst_offset = -dst_offset;
 	} else {
 		neg = 1;
-		adj_sec = dst_offset;
 	}
 
-	adj_sec = (adj_sec / NS_PER_SEC) * NS_PER_SEC;
-	if (!adj_sec)
+	if (!dst_offset)
 		return;
 
 	if (neg)
-		adj_sec = -adj_sec;
+		dst_offset = -dst_offset;
 
-	clockadj_step(dst_id, adj_sec);
+	clockadj_step(dst_id, dst_offset);
 }
+
+#define CPTS_EXTTS_DISCARDS_MAX  2
+#define OTHER_EXTTS_DISCARDS_MAX (5 * CPTS_EXTTS_DISCARDS_MAX)
+#define INIT_EXTTS_DIFF_MAX      100000
 
 static int autocfg_extts_init_clocks(struct node *node)
 {
@@ -1011,8 +1013,8 @@ static int autocfg_extts_init_clocks(struct node *node)
 	struct clock *cpts = NULL;
 	clockid_t master_clkid;
 
-	int64_t extts_offset;
-	uint64_t extts_ts;
+	int64_t extts_offset, d;
+	uint64_t extts_ts, cpts_extts_ts;
 	int i;
 
 	if (!node->master)
@@ -1020,7 +1022,21 @@ static int autocfg_extts_init_clocks(struct node *node)
 
 	master_clkid = node->master->clkid;
 
-	/* disable pps output and latch on all clocks */
+	/* Disable latch on all clocks. "All clocks" is just in case. */
+	LIST_FOREACH(clock, &node->clocks, list) {
+		if (clock->clkid == CLOCK_REALTIME)
+			continue;
+
+		if (clock->dup_phc)
+			continue;
+
+		extts_input_control(clock, CLK_EXTTS_IDX(n, clock), 0);
+
+		if (IS_CPTS_CLOCK(n, clock))
+			cpts = clock;
+	}
+
+	/* Disable pps output on all clocks. "ALL clocks" is just in case. */
 	LIST_FOREACH(clock, &node->clocks, list) {
 		if (clock->clkid == CLOCK_REALTIME)
 			continue;
@@ -1029,11 +1045,27 @@ static int autocfg_extts_init_clocks(struct node *node)
 			continue;
 
 		pps_output_control(clock->clkid, 0);
-		extts_input_control(clock, CLK_EXTTS_IDX(n, clock), 0);
+	}
 
-		if (IS_CPTS_CLOCK(n, clock))
-			cpts = clock;
+	LIST_FOREACH(clock, &node->clocks, list) {
+		/* don't try to init the clock to itself */
+		if (clock->clkid == master_clkid ||
+		    (clock->phc_index >= 0 &&
+		     clock->phc_index == node->master->phc_index) ||
+		    !strcmp(clock->device, node->master->device))
+			continue;
 
+		if (clock->clkid == CLOCK_REALTIME)
+			continue;
+
+		if (clock->state == PS_UNCALIBRATED)
+			continue;
+
+		if (clock->dup_phc)
+			continue;
+
+		autocfg_extts_clock_settime(node, master_clkid,
+					    clock->clkid);
 	}
 
 	/* enable pps output on master clock */
@@ -1054,10 +1086,6 @@ static int autocfg_extts_init_clocks(struct node *node)
 			if (clock->dup_phc)
 				continue;
 
-			autocfg_extts_clock_settime(node,
-						    master_clkid,
-						    clock->clkid);
-
 			extts_input_control(clock,
 					   CLK_EXTTS_IDX(n, clock), 1);
 		}
@@ -1065,25 +1093,8 @@ static int autocfg_extts_init_clocks(struct node *node)
 		return 0;
 	}
 
-	/* Now cpts is not the master clk. But it may not even exist.
-	 * If it does exist, make sure it is ready first.
-	 */
-	if (cpts && cpts->state != PS_UNCALIBRATED) {
-		extts_input_control(cpts, CLK_EXTTS_IDX(n, cpts), 1);
-		for (i = 0; i < 2; i++) {
-			if (!read_extts(CLOCKID_TO_FD(cpts->clkid),
-					&extts_offset,
-					&extts_ts, CLK_EXTTS_IDX(n, cpts))) {
-				pr_info("%s read_extts failed", cpts->device);
-				return -1;
-			}
-		}
-
-		autocfg_extts_clock_settime(node, master_clkid,
-					    cpts->clkid);
-	}
-
-	/* Get the other clocks ready. */
+	/* Now cpts is not the master clk or it may not even exist. */
+	/* Get non-cpts slave phc ready first. */
 	LIST_FOREACH(clock, &node->clocks, list) {
 		/* don't try to init the clock to itself */
 		if (clock->clkid == master_clkid ||
@@ -1104,10 +1115,74 @@ static int autocfg_extts_init_clocks(struct node *node)
 		if (clock->dup_phc)
 			continue;
 
-		autocfg_extts_clock_settime(node, master_clkid,
-					    clock->clkid);
-
 		extts_input_control(clock, CLK_EXTTS_IDX(n, clock), 1);
+	}
+
+	/* If cpts exists and is not the internal master clock,
+	 * enable its pps latch now.
+	 */
+	if (cpts && cpts->state != PS_UNCALIBRATED) {
+		extts_input_control(cpts, CLK_EXTTS_IDX(n, cpts), 1);
+		for (i = 0; i < CPTS_EXTTS_DISCARDS_MAX; i++) {
+			if (!read_extts(CLOCKID_TO_FD(cpts->clkid),
+					&extts_offset,
+					&cpts_extts_ts, CLK_EXTTS_IDX(n, cpts))) {
+				pr_err("%s read_extts failed", cpts->device);
+				return -1;
+			} else {
+				pr_debug("cpts discard extts_ts %llu",
+					 cpts_extts_ts);
+			}
+		}
+	}
+
+	/* Enable other internal slave clocks' pps latch */
+	LIST_FOREACH(clock, &node->clocks, list) {
+		/* don't try to init the clock to itself */
+		if (clock->clkid == master_clkid ||
+		    (clock->phc_index >= 0 &&
+		     clock->phc_index == node->master->phc_index) ||
+		    !strcmp(clock->device, node->master->device))
+			continue;
+
+		if (cpts && clock->clkid == cpts->clkid)
+			continue;
+
+		if (clock->clkid == CLOCK_REALTIME)
+			continue;
+
+		if (clock->state == PS_UNCALIBRATED)
+			continue;
+
+		if (clock->dup_phc)
+			continue;
+
+		for (i = 0; i < OTHER_EXTTS_DISCARDS_MAX; i++) {
+			if (!read_extts(CLOCKID_TO_FD(clock->clkid),
+					&extts_offset,
+					&extts_ts, CLK_EXTTS_IDX(n, clock))) {
+				pr_err("%s read_extts failed", clock->device);
+				return -1;
+			}
+
+			d = extts_ts - cpts_extts_ts;
+			pr_debug("%s discard extts_ts %llu d %lld",
+				 clock->device, extts_ts, d);
+
+			if ((-INIT_EXTTS_DIFF_MAX <= d) &&
+			    (d <= INIT_EXTTS_DIFF_MAX)) {
+				if ( i < 1) {
+					pr_info("*** Matching extts at queue head. IGNORE.");
+				} else {
+					break;
+				}
+			}
+		}
+
+		if (i == OTHER_EXTTS_DISCARDS_MAX) {
+			pr_err("%s ERR in init clocks", clock->device);
+			return -1;
+		}
 	}
 
 	return 0;
@@ -1180,10 +1255,6 @@ static int do_autocfg_extts_loop(struct node *node, int subscriptions)
 				continue;
 
 			update_clock(node, clock, extts_offset, extts_ts, -1);
-
-			autocfg_extts_clock_settime(node, node->master->clkid,
-						    clock->clkid);
-
 		}
 	}
 
