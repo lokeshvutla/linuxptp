@@ -1003,7 +1003,7 @@ static void autocfg_extts_clock_settime(struct node *node,
 }
 
 #define CPTS_EXTTS_DISCARDS_MAX  2
-#define OTHER_EXTTS_DISCARDS_MAX (5 * CPTS_EXTTS_DISCARDS_MAX)
+#define OTHER_EXTTS_DISCARDS_MAX 10
 #define INIT_EXTTS_DIFF_MAX      100000
 
 static int autocfg_extts_init_clocks(struct node *node)
@@ -1118,25 +1118,29 @@ static int autocfg_extts_init_clocks(struct node *node)
 		extts_input_control(clock, CLK_EXTTS_IDX(n, clock), 1);
 	}
 
-	/* If cpts exists and is not the internal master clock,
+	/* cpts does not exist or it is becoming internal master */
+	if (!cpts || cpts->state == PS_UNCALIBRATED)
+		return 0;
+
+	/* cpts exists and is not the internal master clock,
 	 * enable its pps latch now.
 	 */
-	if (cpts && cpts->state != PS_UNCALIBRATED) {
-		extts_input_control(cpts, CLK_EXTTS_IDX(n, cpts), 1);
-		for (i = 0; i < CPTS_EXTTS_DISCARDS_MAX; i++) {
-			if (!read_extts(CLOCKID_TO_FD(cpts->clkid),
-					&extts_offset,
-					&cpts_extts_ts, CLK_EXTTS_IDX(n, cpts))) {
-				pr_err("%s read_extts failed", cpts->device);
-				return -1;
-			} else {
-				pr_debug("cpts discard extts_ts %llu",
-					 cpts_extts_ts);
-			}
+	extts_input_control(cpts, CLK_EXTTS_IDX(n, cpts), 1);
+	for (i = 0; i < CPTS_EXTTS_DISCARDS_MAX; i++) {
+		if (!read_extts(CLOCKID_TO_FD(cpts->clkid),
+				&extts_offset,
+				&cpts_extts_ts, CLK_EXTTS_IDX(n, cpts))) {
+			pr_err("%s read_extts failed", cpts->device);
+			return -1;
+		} else {
+			pr_debug("cpts discard extts_ts %llu",
+				 cpts_extts_ts);
 		}
 	}
 
-	/* Enable other internal slave clocks' pps latch */
+	/* cpts as internal slave is now ready, bring the other
+	 * internal slave clocks to sync to the same pps as cpts
+	 */
 	LIST_FOREACH(clock, &node->clocks, list) {
 		/* don't try to init the clock to itself */
 		if (clock->clkid == master_clkid ||
@@ -1183,6 +1187,7 @@ static int autocfg_extts_init_clocks(struct node *node)
 			pr_err("%s ERR in init clocks", clock->device);
 			return -1;
 		}
+
 	}
 
 	return 0;
