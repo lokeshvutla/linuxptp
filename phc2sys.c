@@ -1073,7 +1073,6 @@ static void autocfg_extts_clock_settime(struct node *node,
 #define EXTTS_INIT_CLOCKS_FAIL          -1
 #define EXTTS_INIT_CLOCKS_OK             0
 #define EXTTS_INIT_CLOCKS_RETRY          1
-#define EXTTS_INIT_CLOCKS_RETRY_EXTEND   2
 
 static inline int close_to_zero(int64_t ns)
 {
@@ -1291,7 +1290,7 @@ static int autocfg_extts_init_clocks(struct node *node,
 			run_pmc_events(node);
 			if (node->state_changed) {
 				pr_info("retry...");
-				return EXTTS_INIT_CLOCKS_RETRY_EXTEND;
+				return EXTTS_INIT_CLOCKS_RETRY;
 			}
 
 			return EXTTS_INIT_CLOCKS_FAIL;
@@ -1432,7 +1431,7 @@ static int autocfg_extts_init_clocks(struct node *node,
 			run_pmc_events(node);
 			if (node->state_changed) {
 				pr_info("retry...");
-				return EXTTS_INIT_CLOCKS_RETRY_EXTEND;
+				return EXTTS_INIT_CLOCKS_RETRY;
 			}
 
 			return EXTTS_INIT_CLOCKS_FAIL;
@@ -1465,18 +1464,11 @@ static int do_autocfg_extts_loop(struct node *node, int subscriptions)
 			continue;
 
 		if (subscriptions) {
-			if (ret == EXTTS_INIT_CLOCKS_RETRY_EXTEND) {
+			if (ret == EXTTS_INIT_CLOCKS_RETRY)
 				ret = 0;
-				max_num_cpts_ts = max_num_ts;
-				max_num_ts *= 2;
-			} else if (ret == EXTTS_INIT_CLOCKS_RETRY) {
-				max_num_cpts_ts = CPTS_EXTTS_DISCARDS_MAX;
-				max_num_ts = OTHER_EXTTS_DISCARDS_MAX;
-			} else {
+			else
 				run_pmc_events(node);
-				max_num_cpts_ts = CPTS_EXTTS_DISCARDS_MAX;
-				max_num_ts = OTHER_EXTTS_DISCARDS_MAX;
-			}
+
 			if (node->state_changed) {
 				/* force getting offset, as it may have
 				 * changed after the port state change */
@@ -1490,7 +1482,7 @@ static int do_autocfg_extts_loop(struct node *node, int subscriptions)
 						node, max_num_cpts_ts,
 						max_num_ts);
 
-					if (ret >= EXTTS_INIT_CLOCKS_RETRY)
+					if (ret == EXTTS_INIT_CLOCKS_RETRY)
 						continue;
 
 					if (ret < EXTTS_INIT_CLOCKS_OK) {
