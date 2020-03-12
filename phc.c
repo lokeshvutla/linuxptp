@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/ptp_clock.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -27,6 +28,7 @@
 #include <unistd.h>
 
 #include "phc.h"
+#include "print.h"
 
 /*
  * On 32 bit platforms, the PHC driver's maximum adjustment (type
@@ -126,4 +128,50 @@ int phc_has_pps(clockid_t clkid)
 	if (phc_get_caps(clkid, &caps))
 		return 0;
 	return caps.pps;
+}
+
+int phc_enable_extts(clockid_t clkid, int chan_index)
+{
+	struct ptp_extts_request extts_request;
+	int fd = CLOCKID_TO_FD(clkid), err;
+
+	memset(&extts_request, 0, sizeof(extts_request));
+	extts_request.index = chan_index;
+	extts_request.flags = PTP_ENABLE_FEATURE;
+	err = ioctl(fd, PTP_EXTTS_REQUEST, &extts_request);
+	if (err)
+		pr_err("Enabling PTP_EXTTS_REQUEST on ptp dev: FAILED\n");
+
+	return err;
+}
+
+int phc_disable_extts(clockid_t clkid, int chan_index)
+{
+	struct ptp_extts_request extts_request;
+	int fd = CLOCKID_TO_FD(clkid), err;
+
+	memset(&extts_request, 0, sizeof(extts_request));
+	extts_request.index = chan_index;
+	extts_request.flags = 0;
+	err = ioctl(fd, PTP_EXTTS_REQUEST, &extts_request);
+	if (err)
+		pr_err("Disabling PTP_EXTTS_REQUEST on ptp dev: FAILED\n");
+
+	return err;
+}
+
+int phc_read_extts(clockid_t clkid, uint64_t *ts)
+{
+	int fd = CLOCKID_TO_FD(clkid), count;
+	struct ptp_extts_event event;
+
+	count = read(fd, &event, sizeof(event));
+	if (count != sizeof(event)) {
+		pr_err("PTP event read %d: FAILED\n", count);
+		return -EINVAL;
+	}
+
+	*ts = event.t.sec * 1000000000ULL + event.t.nsec;
+
+	return 0;
 }

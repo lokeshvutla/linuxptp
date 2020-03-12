@@ -77,4 +77,33 @@ int phc_pin_setfunc(clockid_t clkid, struct ptp_pin_desc *desc);
  */
 int phc_has_pps(clockid_t clkid);
 
+/**
+ * Enables support for PTP external timestamp requests.
+ *
+ * @param clkid: A clock ID obtained using phc_open().
+ * @param chan_index: Channel in which external timestamps are to be enabled.
+ *
+ * @return Zero if external timestamp is enabled else appropriate error value.
+ */
+int phc_enable_extts(clockid_t clkid, int chan_index);
+
+/**
+ * Disables support for PTP external timestamp requests.
+ *
+ * @param clkid: A clock ID obtained using phc_open().
+ * @param chan_index: Channel in which external timestamps are to be disabled.
+ *
+ * @return Zero if external timestamp is enabled else appropriate error value.
+ */
+int phc_disable_extts(clockid_t clkid, int chan_index);
+
+/**
+ * Reads the external timestamp from PTP device.
+ *
+ * @param clkid: A clock ID obtained using phc_open().
+ * @param ts: Pointer to variable in which the timestamp is stored.
+ *
+ * @return Zero if successfully read from ptp else appropriate error value.
+ */
+int phc_read_extts(clockid_t clkid, uint64_t *ts);
 #endif
