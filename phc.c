@@ -175,3 +175,13 @@ int phc_read_extts(clockid_t clkid, uint64_t *ts)
 
 	return 0;
 }
+
+int phc_has_writephase(clockid_t clkid)
+{
+	struct ptp_clock_caps caps;
+
+	if (phc_get_caps(clkid, &caps)) {
+		return 0;
+	}
+	return caps.adjust_phase;
+}

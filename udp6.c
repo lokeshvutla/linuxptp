@@ -227,7 +227,7 @@ no_event:
 static int udp6_recv(struct transport *t, int fd, void *buf, int buflen,
 		     struct address *addr, struct hw_timestamp *hwts)
 {
-	return sk_receive(fd, buf, buflen, addr, hwts, 0);
+	return sk_receive(fd, buf, buflen, addr, hwts, MSG_DONTWAIT);
 }
 
 static int udp6_send(struct transport *t, struct fdarray *fda,
@@ -271,7 +271,7 @@ static int udp6_send(struct transport *t, struct fdarray *fda,
 	cnt = sendto(fd, buf, len, 0, &addr->sa, sizeof(addr->sin6));
 	if (cnt < 1) {
 		pr_err("sendto failed: %m");
-		return cnt;
+		return -errno;
 	}
 	/*
 	 * Get the time stamp right away.

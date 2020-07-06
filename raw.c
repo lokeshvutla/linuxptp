@@ -279,7 +279,7 @@ static int raw_recv(struct transport *t, int fd, void *buf, int buflen,
 	buflen += hlen;
 	hdr = (struct eth_hdr *) ptr;
 
-	cnt = sk_receive(fd, ptr, buflen, addr, hwts, 0);
+	cnt = sk_receive(fd, ptr, buflen, addr, hwts, MSG_DONTWAIT);
 
 	if (cnt >= 0)
 		cnt -= hlen;
@@ -336,8 +336,7 @@ static int raw_send(struct transport *t, struct fdarray *fda,
 
 	cnt = send(fd, ptr, len, 0);
 	if (cnt < 1) {
-		pr_err("send failed: %d %m", errno);
-		return cnt;
+		return -errno;
 	}
 	/*
 	 * Get the time stamp right away.

@@ -23,6 +23,7 @@
 #include "dm.h"
 #include "ds.h"
 #include "config.h"
+#include "monitor.h"
 #include "notification.h"
 #include "servo.h"
 #include "tlv.h"
@@ -268,6 +269,13 @@ struct servo *clock_servo(struct clock *c);
 enum servo_state clock_servo_state(struct clock *c);
 
 /**
+ * Obtain the slave monitor instance from a clock.
+ * @param c The clock instance.
+ * @return  The slave monitor associated with the clock.
+ */
+struct monitor *clock_slave_monitor(struct clock *c);
+
+/**
  * Obtain the slave-only flag from a clock's default data set.
  * @param c  The clock instance.
  * @return   The value of the clock's slave-only flag.
@@ -320,9 +328,9 @@ void clock_sync_interval(struct clock *c, int n);
 /**
  * Obtain a clock's time properties data set.
  * @param c  The clock instance.
- * @return   A pointer to the time properties data set of the clock.
+ * @return   A copy of the clock's time properties data set.
  */
-struct timePropertiesDS *clock_time_properties(struct clock *c);
+struct timePropertiesDS clock_time_properties(struct clock *c);
 
 /**
  * Update a clock's time properties data set.

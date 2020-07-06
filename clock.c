@@ -22,6 +22,7 @@
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/queue.h>
 
 #include "address.h"
@@ -102,6 +103,8 @@ struct clock {
 	int sde;
 	int free_running;
 	int freq_est_interval;
+	int local_sync_uncertain;
+	int write_phase_mode;
 	int grand_master_capable; /* for 802.1AS only */
 	int utc_timescale;
 	int utc_offset_set;
@@ -128,6 +131,7 @@ struct clock {
 	struct clockcheck *sanity_check;
 	struct interface *udsif;
 	LIST_HEAD(clock_subscribers_head, clock_subscriber) subscribers;
+	struct monitor *slave_event_monitor;
 };
 
 struct clock the_clock;
@@ -135,6 +139,7 @@ struct clock the_clock;
 static void handle_state_decision_event(struct clock *c);
 static int clock_resize_pollfd(struct clock *c, int new_nports);
 static void clock_remove_port(struct clock *c, struct port *p);
+static void clock_stats_display(struct clock_stats *s);
 
 static void remove_subscriber(struct clock_subscriber *s)
 {
@@ -267,6 +272,7 @@ void clock_destroy(struct clock *c)
 	LIST_FOREACH_SAFE(p, &c->ports, list, tmp) {
 		clock_remove_port(c, p);
 	}
+	monitor_destroy(c->slave_event_monitor);
 	port_close(c->uds_port);
 	free(c->pollfd);
 	if (c->clkid != CLOCK_REALTIME) {
@@ -444,6 +450,11 @@ static int clock_management_fill_response(struct clock *c, struct port *p,
 		clock_get_subscription(c, req, sen->bitmask, &sen->duration);
 		datalen = sizeof(*sen);
 		break;
+	case TLV_SYNCHRONIZATION_UNCERTAIN_NP:
+		mtd = (struct management_tlv_datum *) tlv->data;
+		mtd->val = c->local_sync_uncertain;
+		datalen = sizeof(*mtd);
+		break;
 	default:
 		/* The caller should *not* respond to this message. */
 		tlv_extra_recycle(extra);
@@ -517,6 +528,21 @@ static int clock_management_set(struct clock *c, struct port *p,
 		clock_update_subscription(c, req, sen->bitmask, sen->duration);
 		respond = 1;
 		break;
+	case TLV_SYNCHRONIZATION_UNCERTAIN_NP:
+		mtd = (struct management_tlv_datum *) tlv->data;
+		switch (mtd->val) {
+		case SYNC_UNCERTAIN_DONTCARE:
+		case SYNC_UNCERTAIN_FALSE:
+		case SYNC_UNCERTAIN_TRUE:
+			/* Display stats on change of local_sync_uncertain */
+			if (c->local_sync_uncertain != mtd->val
+			    && stats_get_num_values(c->stats.offset))
+				clock_stats_display(&c->stats);
+			c->local_sync_uncertain = mtd->val;
+			respond = 1;
+			break;
+		}
+		break;
 	}
 	if (respond && !clock_management_get_response(c, p, id, req))
 		pr_err("failed to send management set response");
@@ -526,13 +552,18 @@ static int clock_management_set(struct clock *c, struct port *p,
 static void clock_stats_update(struct clock_stats *s,
 			       double offset, double freq)
 {
-	struct stats_result offset_stats, freq_stats, delay_stats;
-
 	stats_add_value(s->offset, offset);
 	stats_add_value(s->freq, freq);
 
 	if (stats_get_num_values(s->offset) < s->max_count)
 		return;
+
+	clock_stats_display(s);
+}
+
+static void clock_stats_display(struct clock_stats *s)
+{
+	struct stats_result offset_stats, freq_stats, delay_stats;
 
 	stats_get_result(s->offset, &offset_stats);
 	stats_get_result(s->freq, &freq_stats);
@@ -560,10 +591,16 @@ static void clock_stats_update(struct clock_stats *s,
 static enum servo_state clock_no_adjust(struct clock *c, tmv_t ingress,
 					tmv_t origin)
 {
-	double fui;
-	double ratio, freq;
 	struct freq_estimator *f = &c->fest;
-	enum servo_state state = SERVO_UNLOCKED;
+	double freq, fui, ratio;
+	enum servo_state state;
+
+	if (c->local_sync_uncertain == SYNC_UNCERTAIN_FALSE) {
+		state = SERVO_LOCKED;
+	} else {
+		state = SERVO_UNLOCKED;
+	}
+
 	/*
 	 * The ratio of the local clock freqency to the master clock
 	 * is estimated by:
@@ -1028,6 +1065,8 @@ struct clock *clock_create(enum clock_type type, struct config *config,
 	c->config = config;
 	c->free_running = config_get_int(config, NULL, "free_running");
 	c->freq_est_interval = config_get_int(config, NULL, "freq_est_interval");
+	c->local_sync_uncertain = SYNC_UNCERTAIN_DONTCARE;
+	c->write_phase_mode = config_get_int(config, NULL, "write_phase_mode");
 	c->grand_master_capable = config_get_int(config, NULL, "gmCapable");
 	c->kernel_leap = config_get_int(config, NULL, "kernel_leap");
 	c->utc_offset = config_get_int(config, NULL, "utc_offset");
@@ -1076,6 +1115,12 @@ struct clock *clock_create(enum clock_type type, struct config *config,
 		   and return 0. Set the frequency back to make sure fadj is
 		   the actual frequency of the clock. */
 		clockadj_set_freq(c->clkid, fadj);
+
+		/* Disable write phase mode if not implemented by driver */
+		if (c->write_phase_mode && !phc_has_writephase(c->clkid)) {
+			pr_err("clock does not support write phase mode");
+			return NULL;
+		}
 	}
 	c->servo = servo_create(c->config, servo, -fadj, max_adj, sw_ts);
 	if (!c->servo) {
@@ -1141,6 +1186,12 @@ struct clock *clock_create(enum clock_type type, struct config *config,
 		return NULL;
 	}
 	clock_fda_changed(c);
+
+	c->slave_event_monitor = monitor_create(config, c->uds_port);
+	if (!c->slave_event_monitor) {
+		pr_err("failed to create slave event monitor");
+		return NULL;
+	}
 
 	/* Create the ports. */
 	STAILQ_FOREACH(iface, &config->interfaces, list) {
@@ -1420,6 +1471,7 @@ int clock_manage(struct clock *c, struct port *p, struct ptp_message *msg)
 	case TLV_TIME_STATUS_NP:
 	case TLV_GRANDMASTER_SETTINGS_NP:
 	case TLV_SUBSCRIBE_EVENTS_NP:
+	case TLV_SYNCHRONIZATION_UNCERTAIN_NP:
 		clock_management_send_error(p, msg, TLV_NOT_SUPPORTED);
 		break;
 	default:
@@ -1507,8 +1559,14 @@ int clock_poll(struct clock *c)
 	LIST_FOREACH(p, &c->ports, list) {
 		/* Let the ports handle their events. */
 		for (i = 0; i < N_POLLFD; i++) {
-			if (cur[i].revents & (POLLIN|POLLPRI)) {
-				event = port_event(p, i);
+			if (cur[i].revents & (POLLIN|POLLPRI|POLLERR)) {
+				if (cur[i].revents & POLLERR) {
+					pr_err("port %d: unexpected socket error",
+					       port_number(p));
+					event = EV_FAULT_DETECTED;
+				} else {
+					event = port_event(p, i);
+				}
 				if (EV_STATE_DECISION_EVENT == event) {
 					c->sde = 1;
 				}
@@ -1582,6 +1640,11 @@ void clock_peer_delay(struct clock *c, tmv_t ppd, tmv_t req, tmv_t rx,
 		stats_add_value(c->stats.delay, tmv_dbl(ppd));
 }
 
+struct monitor *clock_slave_monitor(struct clock *c)
+{
+	return c->slave_event_monitor;
+}
+
 int clock_slave_only(struct clock *c)
 {
 	return c->dds.flags & DDS_SLAVE_ONLY;
@@ -1632,10 +1695,22 @@ int clock_switch_phc(struct clock *c, int phc_index)
 	return 0;
 }
 
+static void clock_synchronize_locked(struct clock *c, double adj)
+{
+	clockadj_set_freq(c->clkid, -adj);
+	if (c->clkid == CLOCK_REALTIME) {
+		sysclk_set_sync();
+	}
+	if (c->sanity_check) {
+		clockcheck_set_freq(c->sanity_check, -adj);
+	}
+}
+
 enum servo_state clock_synchronize(struct clock *c, tmv_t ingress, tmv_t origin)
 {
-	double adj, weight;
 	enum servo_state state = SERVO_UNLOCKED;
+	double adj, weight;
+	int64_t offset;
 
 	c->ingress_ts = ingress;
 
@@ -1659,18 +1734,10 @@ enum servo_state clock_synchronize(struct clock *c, tmv_t ingress, tmv_t origin)
 		return clock_no_adjust(c, ingress, origin);
 	}
 
-	adj = servo_sample(c->servo, tmv_to_nanoseconds(c->master_offset),
-			   tmv_to_nanoseconds(ingress), weight, &state);
+	offset = tmv_to_nanoseconds(c->master_offset);
+	adj = servo_sample(c->servo, offset, tmv_to_nanoseconds(ingress),
+			   weight, &state);
 	c->servo_state = state;
-
-	if (c->stats.max_count > 1) {
-		clock_stats_update(&c->stats, tmv_dbl(c->master_offset), adj);
-	} else {
-		pr_info("master offset %10" PRId64 " s%d freq %+7.0f "
-			"path delay %9" PRId64,
-			tmv_to_nanoseconds(c->master_offset), state, adj,
-			tmv_to_nanoseconds(c->path_delay));
-	}
 
 	tsproc_set_clock_rate_ratio(c->tsproc, clock_rate_ratio(c));
 
@@ -1689,16 +1756,27 @@ enum servo_state clock_synchronize(struct clock *c, tmv_t ingress, tmv_t origin)
 		tsproc_reset(c->tsproc, 0);
 		break;
 	case SERVO_LOCKED:
+		clock_synchronize_locked(c, adj);
+		break;
 	case SERVO_LOCKED_STABLE:
-		clockadj_set_freq(c->clkid, -adj);
-		if (c->clkid == CLOCK_REALTIME) {
-			sysclk_set_sync();
-		}
-		if (c->sanity_check) {
-			clockcheck_set_freq(c->sanity_check, -adj);
+		if (c->write_phase_mode) {
+			clockadj_set_phase(c->clkid, -offset);
+			adj = 0;
+		} else {
+			clock_synchronize_locked(c, adj);
 		}
 		break;
 	}
+
+	if (c->stats.max_count > 1) {
+		clock_stats_update(&c->stats, tmv_dbl(c->master_offset), adj);
+	} else {
+		pr_info("master offset %10" PRId64 " s%d freq %+7.0f "
+			"path delay %9" PRId64,
+			tmv_to_nanoseconds(c->master_offset), state, adj,
+			tmv_to_nanoseconds(c->path_delay));
+	}
+
 	return state;
 }
 
@@ -1727,9 +1805,22 @@ void clock_sync_interval(struct clock *c, int n)
 	servo_sync_interval(c->servo, n < 0 ? 1.0 / (1 << -n) : 1 << n);
 }
 
-struct timePropertiesDS *clock_time_properties(struct clock *c)
+struct timePropertiesDS clock_time_properties(struct clock *c)
 {
-	return &c->tds;
+	struct timePropertiesDS tds = c->tds;
+
+	switch (c->local_sync_uncertain) {
+	case SYNC_UNCERTAIN_DONTCARE:
+		tds.flags &= ~SYNC_UNCERTAIN;
+		break;
+	case SYNC_UNCERTAIN_FALSE:
+		/* Pass the upstream value, if any. */
+		break;
+	case SYNC_UNCERTAIN_TRUE:
+		tds.flags |= SYNC_UNCERTAIN;
+		break;
+	}
+	return tds;
 }
 
 void clock_update_time_properties(struct clock *c, struct timePropertiesDS tds)

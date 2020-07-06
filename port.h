@@ -33,6 +33,9 @@ struct clock;
 /** Opaque type. */
 struct port;
 
+/** The port identity that matches any port. */
+extern const struct PortIdentity wildcard_pid;
+
 /**
  * Returns the dataset from a port's best foreign clock record, if any
  * has yet been discovered. This function does not bring the returned
@@ -94,7 +97,7 @@ int port_forward(struct port *p, struct ptp_message *msg);
  * Forward a message on a given port to the address stored in the message.
  * @param port    A pointer previously obtained via port_open().
  * @param msg     The message to send. Must be in network byte order.
- * @return        Zero on success, non-zero otherwise.
+ * @return        Zero on success, negative errno value otherwise.
  */
 int port_forward_to(struct port *p, struct ptp_message *msg);
 
@@ -206,6 +209,9 @@ struct port *port_open(const char *phc_device,
 		       int number,
 		       struct interface *interface,
 		       struct clock *clock);
+
+struct ptp_message *port_signaling_construct(struct port *p,
+					     const struct PortIdentity *tpid);
 
 /**
  * Returns a port's current state.

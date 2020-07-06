@@ -106,4 +106,15 @@ int phc_disable_extts(clockid_t clkid, int chan_index);
  * @return Zero if successfully read from ptp else appropriate error value.
  */
 int phc_read_extts(clockid_t clkid, uint64_t *ts);
+
+/**
+ * Checks whether the given PTP hardware clock device supports write phase mode.
+ *
+ * @param clkid A clock ID obtained using phc_open().
+ *
+ * @return Zero if write phase mode is not supported by the clock, non-zero
+ * otherwise.
+ */
+int phc_has_writephase(clockid_t clkid);
+
 #endif

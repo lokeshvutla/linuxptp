@@ -19,6 +19,7 @@
 #include <ctype.h>
 #include <float.h>
 #include <limits.h>
+#include <linux/ptp_clock.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -169,6 +170,13 @@ static struct config_enum delay_mech_enu[] = {
 	{ NULL, 0 },
 };
 
+static struct config_enum extts_polarity_enu[] = {
+	{ "rising",  PTP_RISING_EDGE  },
+	{ "falling", PTP_FALLING_EDGE },
+	{ "both",    PTP_RISING_EDGE | PTP_FALLING_EDGE },
+	{ NULL, 0 },
+};
+
 static struct config_enum hwts_filter_enu[] = {
 	{ "normal",  HWTS_FILTER_NORMAL  },
 	{ "check",   HWTS_FILTER_CHECK   },
@@ -263,6 +271,7 @@ struct config_item config_tab[] = {
 	GLOB_ITEM_STR("manufacturerIdentity", "00:00:00"),
 	GLOB_ITEM_INT("max_frequency", 900000000, 0, INT_MAX),
 	PORT_ITEM_INT("min_neighbor_prop_delay", -20000000, INT_MIN, -1),
+	PORT_ITEM_INT("msg_interval_request", 0, 0, 1),
 	PORT_ITEM_INT("neighborPropDelayThresh", 20000000, 0, INT_MAX),
 	PORT_ITEM_INT("net_sync_monitor", 0, 0, 1),
 	PORT_ITEM_ENU("network_transport", TRANS_UDP_IPV4, nw_trans_enu),
@@ -288,6 +297,7 @@ struct config_item config_tab[] = {
 	GLOB_ITEM_INT("sanity_freq_limit", 200000000, 0, INT_MAX),
 	GLOB_ITEM_INT("servo_num_offset_values", 10, 0, INT_MAX),
 	GLOB_ITEM_INT("servo_offset_threshold", 0, 0, INT_MAX),
+	GLOB_ITEM_STR("slave_event_monitor", ""),
 	GLOB_ITEM_INT("slaveOnly", 0, 0, 1),
 	GLOB_ITEM_INT("socket_priority", 0, 0, 15),
 	GLOB_ITEM_DBL("step_threshold", 0.0, 0.0, DBL_MAX),
@@ -297,6 +307,15 @@ struct config_item config_tab[] = {
 	GLOB_ITEM_INT("timeSource", INTERNAL_OSCILLATOR, 0x10, 0xfe),
 	GLOB_ITEM_ENU("time_stamping", TS_HARDWARE, timestamping_enu),
 	PORT_ITEM_INT("transportSpecific", 0, 0, 0x0F),
+	PORT_ITEM_INT("ts2phc.channel", 0, 0, INT_MAX),
+	PORT_ITEM_INT("ts2phc.extts_correction", 0, INT_MIN, INT_MAX),
+	PORT_ITEM_ENU("ts2phc.extts_polarity", PTP_RISING_EDGE, extts_polarity_enu),
+	PORT_ITEM_INT("ts2phc.master", 0, 0, 1),
+	GLOB_ITEM_STR("ts2phc.nmea_remote_host", ""),
+	GLOB_ITEM_STR("ts2phc.nmea_remote_port", ""),
+	GLOB_ITEM_STR("ts2phc.nmea_serialport", "/dev/ttyS0"),
+	PORT_ITEM_INT("ts2phc.pin_index", 0, 0, INT_MAX),
+	GLOB_ITEM_INT("ts2phc.pulsewidth", 500000000, 1000000, 999000000),
 	PORT_ITEM_ENU("tsproc_mode", TSPROC_FILTER, tsproc_enu),
 	GLOB_ITEM_INT("twoStepFlag", 1, 0, 1),
 	GLOB_ITEM_INT("tx_timestamp_timeout", 1, 1, INT_MAX),
@@ -310,6 +329,7 @@ struct config_item config_tab[] = {
 	GLOB_ITEM_STR("userDescription", ""),
 	GLOB_ITEM_INT("utc_offset", CURRENT_UTC_OFFSET, 0, INT_MAX),
 	GLOB_ITEM_INT("verbose", 0, 0, 1),
+	GLOB_ITEM_INT("write_phase_mode", 0, 0, 1),
 };
 
 static struct unicast_master_table *current_uc_mtab;

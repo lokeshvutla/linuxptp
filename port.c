@@ -412,7 +412,7 @@ static int follow_up_info_append(struct ptp_message *m)
 
 static int net_sync_resp_append(struct port *p, struct ptp_message *m)
 {
-	struct timePropertiesDS *tp = clock_time_properties(p->clock);
+	struct timePropertiesDS tp = clock_time_properties(p->clock);
 	struct ClockIdentity cid = clock_identity(p->clock), pid;
 	struct currentDS *cds = clock_current_dataset(p->clock);
 	struct parent_ds *dad = clock_parent_ds(p->clock);
@@ -468,7 +468,7 @@ static int net_sync_resp_append(struct port *p, struct ptp_message *m)
 
 	memcpy(&extra->foot->parent, &dad->pds, sizeof(extra->foot->parent));
 	memcpy(&extra->foot->current, cds, sizeof(extra->foot->current));
-	memcpy(&extra->foot->timeprop, tp, sizeof(extra->foot->timeprop));
+	memcpy(&extra->foot->timeprop, &tp, sizeof(extra->foot->timeprop));
 	memcpy(&extra->foot->lastsync, &last_sync, sizeof(extra->foot->lastsync));
 
 	return 0;
@@ -1131,7 +1131,32 @@ static void port_slave_priority_warning(struct port *p)
 	pr_warning("port %hu: defaultDS.priority1 probably misconfigured", n);
 }
 
+static void message_interval_request(struct port *p,
+				     enum servo_state last_state,
+				     Integer8 sync_interval)
+{
+	if (!p->msg_interval_request)
+		return;
+
+	if (last_state == SERVO_LOCKED) {
+		p->logPdelayReqInterval = p->operLogPdelayReqInterval;
+		p->logSyncInterval = p->operLogSyncInterval;
+		port_tx_interval_request(p, SIGNAL_NO_CHANGE,
+					 p->logSyncInterval,
+					 SIGNAL_NO_CHANGE);
+		port_dispatch(p, EV_MASTER_CLOCK_SELECTED, 0);
+	} else if (sync_interval != p->operLogSyncInterval) {
+		/*
+		 * The most likely reason for this to happen is the
+		 * master daemon re-initialized due to some fault.
+		 */
+		servo_reset(clock_servo(p->clock));
+		port_dispatch(p, EV_SYNCHRONIZATION_FAULT, 0);
+	}
+}
+
 static void port_synchronize(struct port *p,
+			     uint16_t seqid,
 			     tmv_t ingress_ts,
 			     struct timestamp origin_ts,
 			     Integer64 correction1, Integer64 correction2,
@@ -1147,6 +1172,17 @@ static void port_synchronize(struct port *p,
 	c1 = correction_to_tmv(correction1);
 	c2 = correction_to_tmv(correction2);
 	t1c = tmv_add(t1, tmv_add(c1, c2));
+
+	switch (p->state) {
+	case PS_UNCALIBRATED:
+	case PS_SLAVE:
+		monitor_sync(p->slave_event_monitor,
+			     clock_parent_identity(p->clock), seqid,
+			     t1, tmv_add(c1, c2), t2);
+		break;
+	default:
+		break;
+	}
 
 	last_state = clock_servo_state(p->clock);
 	state = clock_synchronize(p->clock, t2, t1c);
@@ -1174,23 +1210,26 @@ static void port_synchronize(struct port *p,
 		port_dispatch(p, EV_MASTER_CLOCK_SELECTED, 0);
 		break;
 	case SERVO_LOCKED_STABLE:
-		if (last_state == SERVO_LOCKED) {
-			p->logPdelayReqInterval = p->operLogPdelayReqInterval;
-			p->logSyncInterval = p->operLogSyncInterval;
-			port_tx_interval_request(p, SIGNAL_NO_CHANGE,
-						 p->logSyncInterval,
-						 SIGNAL_NO_CHANGE);
-			port_dispatch(p, EV_MASTER_CLOCK_SELECTED, 0);
-		} else if (sync_interval != p->operLogSyncInterval) {
-			/*
-			 * The most likely reason for this to happen is the
-			 * master daemon re-initialized due to some fault.
-			 */
-			servo_reset(clock_servo(p->clock));
-			port_dispatch(p, EV_SYNCHRONIZATION_FAULT, 0);
-		}
+		message_interval_request(p, last_state, sync_interval);
 		break;
 	}
+}
+
+static void port_syfufsm_print_mismatch(struct port *p, enum syfu_event event,
+					struct ptp_message *m)
+{
+	int expected_msgtype;
+
+	if (event == SYNC_MISMATCH)
+		expected_msgtype = FOLLOW_UP;
+	else
+		expected_msgtype = SYNC;
+
+	pr_debug("port %hu: have %s %hu, expecting %s but got %s %hu, dropping",
+		 portnum(p), msg_type_string(msg_type(p->last_syncfup)),
+		 p->last_syncfup->header.sequenceId,
+		 msg_type_string(expected_msgtype),
+		 msg_type_string(msg_type(m)), m->header.sequenceId);
 }
 
 /*
@@ -1227,6 +1266,7 @@ static void port_syfufsm(struct port *p, enum syfu_event event,
 	case SF_HAVE_SYNC:
 		switch (event) {
 		case SYNC_MISMATCH:
+			port_syfufsm_print_mismatch(p, event, m);
 			msg_put(p->last_syncfup);
 			msg_get(m);
 			p->last_syncfup = m;
@@ -1234,6 +1274,7 @@ static void port_syfufsm(struct port *p, enum syfu_event event,
 		case SYNC_MATCH:
 			break;
 		case FUP_MISMATCH:
+			port_syfufsm_print_mismatch(p, event, m);
 			msg_put(p->last_syncfup);
 			msg_get(m);
 			p->last_syncfup = m;
@@ -1241,7 +1282,8 @@ static void port_syfufsm(struct port *p, enum syfu_event event,
 			break;
 		case FUP_MATCH:
 			syn = p->last_syncfup;
-			port_synchronize(p, syn->hwts.ts, m->ts.pdu,
+			port_synchronize(p, syn->header.sequenceId,
+					 syn->hwts.ts, m->ts.pdu,
 					 syn->header.correction,
 					 m->header.correction,
 					 m->header.logMessageInterval);
@@ -1254,6 +1296,7 @@ static void port_syfufsm(struct port *p, enum syfu_event event,
 	case SF_HAVE_FUP:
 		switch (event) {
 		case SYNC_MISMATCH:
+			port_syfufsm_print_mismatch(p, event, m);
 			msg_put(p->last_syncfup);
 			msg_get(m);
 			p->last_syncfup = m;
@@ -1261,7 +1304,8 @@ static void port_syfufsm(struct port *p, enum syfu_event event,
 			break;
 		case SYNC_MATCH:
 			fup = p->last_syncfup;
-			port_synchronize(p, m->hwts.ts, fup->ts.pdu,
+			port_synchronize(p, fup->header.sequenceId,
+					 m->hwts.ts, fup->ts.pdu,
 					 m->header.correction,
 					 fup->header.correction,
 					 m->header.logMessageInterval);
@@ -1269,6 +1313,7 @@ static void port_syfufsm(struct port *p, enum syfu_event event,
 			p->syfu = SF_EMPTY;
 			break;
 		case FUP_MISMATCH:
+			port_syfufsm_print_mismatch(p, event, m);
 			msg_put(p->last_syncfup);
 			msg_get(m);
 			p->last_syncfup = m;
@@ -1397,7 +1442,7 @@ out:
 
 int port_tx_announce(struct port *p, struct address *dst)
 {
-	struct timePropertiesDS *tp = clock_time_properties(p->clock);
+	struct timePropertiesDS tp = clock_time_properties(p->clock);
 	struct parent_ds *dad = clock_parent_ds(p->clock);
 	struct ptp_message *msg;
 	int err;
@@ -1424,19 +1469,19 @@ int port_tx_announce(struct port *p, struct address *dst)
 	msg->header.control            = CTL_OTHER;
 	msg->header.logMessageInterval = p->logAnnounceInterval;
 
-	msg->header.flagField[1] = tp->flags;
+	msg->header.flagField[1] = tp.flags;
 
 	if (dst) {
 		msg->address = *dst;
 		msg->header.flagField[0] |= UNICAST;
 	}
-	msg->announce.currentUtcOffset        = tp->currentUtcOffset;
+	msg->announce.currentUtcOffset        = tp.currentUtcOffset;
 	msg->announce.grandmasterPriority1    = dad->pds.grandmasterPriority1;
 	msg->announce.grandmasterClockQuality = dad->pds.grandmasterClockQuality;
 	msg->announce.grandmasterPriority2    = dad->pds.grandmasterPriority2;
 	msg->announce.grandmasterIdentity     = dad->pds.grandmasterIdentity;
 	msg->announce.stepsRemoved            = clock_steps_removed(p->clock);
-	msg->announce.timeSource              = tp->timeSource;
+	msg->announce.timeSource              = tp.timeSource;
 
 	if (p->path_trace_enabled && path_trace_append(p, msg, dad)) {
 		pr_err("port %hu: append path trace failed", portnum(p));
@@ -1928,6 +1973,9 @@ void process_delay_resp(struct port *p, struct ptp_message *m)
 	t4 = timestamp_to_tmv(m->ts.pdu);
 	t4c = tmv_sub(t4, c3);
 
+	monitor_delay(p->slave_event_monitor, clock_parent_identity(p->clock),
+		      m->header.sequenceId, t3, c3, t4);
+
 	clock_path_delay(p->clock, t3, t4c);
 
 	TAILQ_REMOVE(&p->delay_req, req, list);
@@ -2287,7 +2335,8 @@ void process_sync(struct port *p, struct ptp_message *m)
 	m->header.correction += p->asymmetry;
 
 	if (one_step(m)) {
-		port_synchronize(p, m->hwts.ts, m->ts.pdu,
+		port_synchronize(p, m->header.sequenceId,
+				 m->hwts.ts, m->ts.pdu,
 				 m->header.correction, 0,
 				 m->header.logMessageInterval);
 		flush_last_sync(p);
@@ -2727,8 +2776,10 @@ int port_forward_to(struct port *p, struct ptp_message *msg)
 {
 	int cnt;
 	cnt = transport_sendto(p->trp, &p->fda, TRANS_GENERAL, msg);
-	if (cnt <= 0) {
-		return -1;
+	if (cnt < 0) {
+		return cnt;
+	} else if (!cnt) {
+		return -EIO;
 	}
 	port_stats_inc_tx(p, msg);
 	return 0;
@@ -3029,6 +3080,7 @@ struct port *port_open(const char *phc_device,
 	p->announce_span = transport == TRANS_UDS ? 0 : ANNOUNCE_SPAN;
 	p->follow_up_info = config_get_int(cfg, p->name, "follow_up_info");
 	p->freq_est_interval = config_get_int(cfg, p->name, "freq_est_interval");
+	p->msg_interval_request = config_get_int(cfg, p->name, "msg_interval_request");
 	p->net_sync_monitor = config_get_int(cfg, p->name, "net_sync_monitor");
 	p->path_trace_enabled = config_get_int(cfg, p->name, "path_trace_enabled");
 	p->tc_spanning_tree = config_get_int(cfg, p->name, "tc_spanning_tree");
@@ -3048,6 +3100,7 @@ struct port *port_open(const char *phc_device,
 	p->state = PS_INITIALIZING;
 	p->delayMechanism = config_get_int(cfg, p->name, "delay_mechanism");
 	p->versionNumber = PTP_VERSION;
+	p->slave_event_monitor = clock_slave_monitor(clock);
 
 	if (number && unicast_client_initialize(p)) {
 		goto err_transport;

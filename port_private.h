@@ -24,6 +24,7 @@
 #include "as_capable.h"
 #include "clock.h"
 #include "fsm.h"
+#include "monitor.h"
 #include "msg.h"
 #include "tmv.h"
 
@@ -128,6 +129,7 @@ struct port {
 	int                 hybrid_e2e;
 	int                 master_only;
 	int                 match_transport_specific;
+	int                 msg_interval_request;
 	int                 min_neighbor_prop_delay;
 	int                 net_sync_monitor;
 	int                 path_trace_enabled;
@@ -149,6 +151,8 @@ struct port {
 	/* unicast service mode */
 	struct unicast_service *unicast_service;
 	int inhibit_multicast_service;
+	/* slave event monitoring */
+	struct monitor *slave_event_monitor;
 };
 
 #define portnum(p) (p->portIdentity.portNumber)

@@ -27,22 +27,13 @@
 
 #define NS_PER_SEC 1000000000LL
 
-#ifdef PTP_SYS_OFFSET
-
 static int64_t pctns(struct ptp_clock_time *t)
 {
 	return t->sec * NS_PER_SEC + t->nsec;
 }
 
-static struct {
-	int64_t interval;
-	int64_t offset;
-	uint64_t timestamp;
-} samples[PTP_MAX_SAMPLES];
-
 static int sysoff_precise(int fd, int64_t *result, uint64_t *ts)
 {
-#ifdef PTP_SYS_OFFSET_PRECISE
 	struct ptp_sys_offset_precise pso;
 	memset(&pso, 0, sizeof(pso));
 	if (ioctl(fd, PTP_SYS_OFFSET_PRECISE, &pso)) {
@@ -52,33 +43,30 @@ static int sysoff_precise(int fd, int64_t *result, uint64_t *ts)
 	*result = pctns(&pso.sys_realtime) - pctns(&pso.device);
 	*ts = pctns(&pso.sys_realtime);
 	return SYSOFF_PRECISE;
-#else
-	return SYSOFF_COMPILE_TIME_MISSING;
-#endif
-}
-
-static void insertion_sort(int length, int64_t interval, int64_t offset, uint64_t ts)
-{
-	int i = length - 1;
-	while (i >= 0) {
-		if (samples[i].interval < interval)
-			break;
-		samples[i+1] = samples[i];
-		i--;
-	}
-	samples[i+1].interval = interval;
-	samples[i+1].offset = offset;
-	samples[i+1].timestamp = ts;
 }
 
 static int64_t sysoff_estimate(struct ptp_clock_time *pct, int extended,
 			       int n_samples, uint64_t *ts, int64_t *delay)
 {
 	int64_t t1, t2, tp;
-	int64_t interval, offset;
-	int i;
+	int64_t interval, timestamp, offset;
+	int64_t shortest_interval, best_timestamp, best_offset;
+	int i = 0;
 
-	for (i = 0; i < n_samples; i++) {
+	if (extended) {
+		t1 = pctns(&pct[3*i]);
+		tp = pctns(&pct[3*i+1]);
+		t2 = pctns(&pct[3*i+2]);
+	} else {
+		t1 = pctns(&pct[2*i]);
+		tp = pctns(&pct[2*i+1]);
+		t2 = pctns(&pct[2*i+2]);
+	}
+	shortest_interval = t2 - t1;
+	best_timestamp = (t2 + t1) / 2;
+	best_offset = best_timestamp - tp;
+
+	for (i = 1; i < n_samples; i++) {
 		if (extended) {
 			t1 = pctns(&pct[3*i]);
 			tp = pctns(&pct[3*i+1]);
@@ -89,18 +77,22 @@ static int64_t sysoff_estimate(struct ptp_clock_time *pct, int extended,
 			t2 = pctns(&pct[2*i+2]);
 		}
 		interval = t2 - t1;
-		offset = (t2 + t1) / 2 - tp;
-		insertion_sort(i, interval, offset, (t2 + t1) / 2);
+		timestamp = (t2 + t1) / 2;
+		offset = timestamp - tp;
+		if (interval < shortest_interval) {
+			shortest_interval = interval;
+			best_timestamp = timestamp;
+			best_offset = offset;
+		}
 	}
-	*ts = samples[0].timestamp;
-	*delay = samples[0].interval;
-	return samples[0].offset;
+	*ts = best_timestamp;
+	*delay = shortest_interval;
+	return best_offset;
 }
 
 static int sysoff_extended(int fd, int n_samples,
 			   int64_t *result, uint64_t *ts, int64_t *delay)
 {
-#ifdef PTP_SYS_OFFSET_EXTENDED
 	struct ptp_sys_offset_extended pso;
 	memset(&pso, 0, sizeof(pso));
 	pso.n_samples = n_samples;
@@ -110,9 +102,6 @@ static int sysoff_extended(int fd, int n_samples,
 	}
 	*result = sysoff_estimate(&pso.ts[0][0], 1, n_samples, ts, delay);
 	return SYSOFF_EXTENDED;
-#else
-	return SYSOFF_COMPILE_TIME_MISSING;
-#endif
 }
 
 static int sysoff_basic(int fd, int n_samples,
@@ -141,7 +130,7 @@ int sysoff_measure(int fd, int method, int n_samples,
 	case SYSOFF_BASIC:
 		return sysoff_basic(fd, n_samples, result, ts, delay);
 	}
-	return SYSOFF_COMPILE_TIME_MISSING;
+	return SYSOFF_RUN_TIME_MISSING;
 }
 
 int sysoff_probe(int fd, int n_samples)
@@ -165,18 +154,3 @@ int sysoff_probe(int fd, int n_samples)
 
 	return SYSOFF_RUN_TIME_MISSING;
 }
-
-#else /* !PTP_SYS_OFFSET */
-
-int sysoff_measure(int fd, int method, int n_samples,
-		   int64_t *result, uint64_t *ts, int64_t *delay)
-{
-	return SYSOFF_COMPILE_TIME_MISSING;
-}
-
-int sysoff_probe(int fd, int n_samples)
-{
-	return SYSOFF_COMPILE_TIME_MISSING;
-}
-
-#endif /* PTP_SYS_OFFSET */
