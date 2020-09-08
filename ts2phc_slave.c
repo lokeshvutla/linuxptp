@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <linux/ptp_clock.h>
 #include <poll.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
@@ -50,7 +51,7 @@ struct ts2phc_slave_array {
 
 struct ts2phc_source_timestamp {
 	struct timespec ts;
-	int valid;
+	bool valid;
 };
 
 enum extts_result {
@@ -223,7 +224,7 @@ no_ext_ts:
 no_pin_func:
 	servo_destroy(slave->servo);
 no_servo:
-	close(slave->fd);
+	posix_clock_close(slave->clk);
 no_posix_clock:
 	free(slave->name);
 	free(slave);
@@ -240,6 +241,7 @@ static void ts2phc_slave_destroy(struct ts2phc_slave *slave)
 	if (ioctl(slave->fd, PTP_EXTTS_REQUEST2, &extts)) {
 		pr_err(PTP_EXTTS_REQUEST_FAILED);
 	}
+	servo_destroy(slave->servo);
 	posix_clock_close(slave->clk);
 	free(slave->name);
 	free(slave);
@@ -265,6 +267,11 @@ static int ts2phc_slave_event(struct ts2phc_slave *slave,
 
 	if (slave->no_adj) {
 		pr_info("%s master offset %10" PRId64, slave->name, offset);
+		return 0;
+	}
+
+	if (!source_ts.valid) {
+		pr_debug("%s ignoring invalid master time stamp", slave->name);
 		return 0;
 	}
 
@@ -397,7 +404,7 @@ int ts2phc_slave_poll(struct ts2phc_master *master)
 {
 	struct ts2phc_source_timestamp source_ts;
 	unsigned int i;
-	int cnt;
+	int cnt, err;
 
 	if (ts2phc_slave_array_create()) {
 		return -1;
@@ -415,7 +422,8 @@ int ts2phc_slave_poll(struct ts2phc_master *master)
 		return 0;
 	}
 
-	source_ts.valid = ts2phc_master_getppstime(master, &source_ts.ts);
+	err = ts2phc_master_getppstime(master, &source_ts.ts);
+	source_ts.valid = err ? false : true;
 
 	for (i = 0; i < ts2phc_n_slaves; i++) {
 		if (polling_array.pfd[i].revents & (POLLIN|POLLPRI)) {
