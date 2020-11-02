@@ -62,7 +62,7 @@ phc2sys: clockadj.o clockcheck.o config.o hash.o interface.o msg.o \
  phc.o phc2sys.o pmc_common.o print.o $(SERVOS) sk.o stats.o \
  sysoff.o tlv.o $(TRANSP) util.o version.o
 
-phc2pwm: util.o pwm.o phc2pwm.o phc.o print.o sk.o
+phc2pwm: util.o version.o pwm.o phc2pwm.o phc.o print.o sk.o
 
 hwstamp_ctl: hwstamp_ctl.o version.o
 

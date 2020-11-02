@@ -38,6 +38,7 @@
 #include "phc.h"
 #include "missing.h"
 #include "print.h"
+#include "version.h"
 
 #define NS_PER_SEC		1000000000LL
 #define PWM_PERIOD		1000000000
@@ -49,12 +50,13 @@ static void usage(char *progname)
 		"\n"
 		"usage: %s [options]\n\n"
 		"\n"
-		" -p [dev]	Clock device to use\n"
-		" -e [id]	PTP index for event/trigger\n"
-		" -w [id]	PWM chip device id\n"
 		" -c [id]	PWM channel id from PWM chip\n"
-		" -l [num]	set the logging level to 'num'\n"
+		" -e [id]	PTP index for event/trigger\n"
 		" -h		prints this message and exits\n"
+		" -l [num]	set the logging level to 'num'\n"
+		" -p [dev]	Clock device to use\n"
+		" -v		prints the software version and exits\n"
+		" -w [id]	PWM chip device id\n"
 		"\n",
 		progname);
 }
@@ -146,7 +148,7 @@ static uint64_t pwm_servo_sample(struct pwm_servo *ps, uint64_t ts)
 
 int main(int argc, char *argv[])
 {
-	unsigned int pwm_chip, pwm_chan, event_index;
+	unsigned int pwm_chip = 0, pwm_chan = 0, event_index = 0;
 	int c, err, level = LOG_INFO;
 	char *progname, *ptp_dev;
 	struct pwm_chan *chan;
@@ -160,32 +162,41 @@ int main(int argc, char *argv[])
 	progname = strrchr(argv[0], '/');
 	progname = progname ? 1+progname : argv[0];
 
-	while (EOF != (c = getopt(argc, argv, "p:e:w:c:l:h"))) {
+	while (EOF != (c = getopt(argc, argv, "c:e:hl:p:vw:"))) {
 		switch (c) {
-		case 'p':
-			ptp_dev = optarg;
+		case 'c':
+			pwm_chan = atoi(optarg);
 			break;
 		case 'e':
 			event_index = atoi(optarg);
 			break;
-		case 'w':
-			pwm_chip = atoi(optarg);
-			break;
-		case 'c':
-			pwm_chan = atoi(optarg);
-			break;
-		case 'l':
-			level = atoi(optarg);
-			break;
 		case 'h':
 			usage(progname);
 			return 0;
+		case 'l':
+			level = atoi(optarg);
+			break;
+		case 'p':
+			ptp_dev = optarg;
+			break;
+		case 'v':
+			version_show(stdout);
+			return 0;
+		case 'w':
+			pwm_chip = atoi(optarg);
+			break;
 		case '?':
 		default:
 			usage(progname);
 			return -1;
 		}
 	}
+
+	if (!ptp_dev) {
+		usage(progname);
+		return -1;
+	}
+
 	handle_term_signals();
 	print_set_progname(progname);
 	print_set_level(level);
@@ -213,7 +224,7 @@ int main(int argc, char *argv[])
 	if (err)
 		goto extts_clean;
 
-	while(is_running()) {
+	while (is_running()) {
 		if (phc_read_extts(clkid, &ts))
 			continue;
 
