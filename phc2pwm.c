@@ -54,6 +54,7 @@ static void usage(char *progname)
 		" -e [id]	PTP index for event/trigger\n"
 		" -h		prints this message and exits\n"
 		" -l [num]	set the logging level to 'num'\n"
+		" -m            print messages to stdout\n"
 		" -p [dev]	Clock device to use\n"
 		" -v		prints the software version and exits\n"
 		" -w [id]	PWM chip device id\n"
@@ -149,7 +150,7 @@ static uint64_t pwm_servo_sample(struct pwm_servo *ps, uint64_t ts)
 int main(int argc, char *argv[])
 {
 	unsigned int pwm_chip = 0, pwm_chan = 0, event_index = 0;
-	int c, err, level = LOG_INFO;
+	int c, err, level = LOG_INFO, verbose = 0;
 	char *progname, *ptp_dev;
 	struct pwm_chan *chan;
 	struct pwm_servo ps;
@@ -162,7 +163,7 @@ int main(int argc, char *argv[])
 	progname = strrchr(argv[0], '/');
 	progname = progname ? 1+progname : argv[0];
 
-	while (EOF != (c = getopt(argc, argv, "c:e:hl:p:vw:"))) {
+	while (EOF != (c = getopt(argc, argv, "c:e:hl:mp:vw:"))) {
 		switch (c) {
 		case 'c':
 			pwm_chan = atoi(optarg);
@@ -175,6 +176,9 @@ int main(int argc, char *argv[])
 			return 0;
 		case 'l':
 			level = atoi(optarg);
+			break;
+		case 'm':
+			verbose = 1;
 			break;
 		case 'p':
 			ptp_dev = optarg;
@@ -200,6 +204,7 @@ int main(int argc, char *argv[])
 	handle_term_signals();
 	print_set_progname(progname);
 	print_set_level(level);
+	print_set_verbose(verbose);
 
 	clkid = phc_open(ptp_dev);
 	if (clkid == CLOCK_INVALID)
