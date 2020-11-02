@@ -233,8 +233,7 @@ int main(int argc, char *argv[])
 		if (phc_read_extts(clkid, &ts))
 			continue;
 
-		fprintf(stdout, "Timestamp = %lld.%09lld\n", ts / NS_PER_SEC,
-			ts % NS_PER_SEC);
+		pr_info("Timestamp = %lld.%09lld\n", ts / NS_PER_SEC, ts % NS_PER_SEC);
 		pwm_chan_set_period(chan, pwm_servo_sample(&ps, ts));
 	}
 
