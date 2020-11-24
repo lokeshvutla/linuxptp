@@ -671,6 +671,7 @@ static int peer_prepare_and_send(struct port *p, struct ptp_message *msg,
 	if (msg_sots_valid(msg)) {
 		ts_add(&msg->hwts.ts, p->tx_timestamp_offset);
 	}
+
 	return 0;
 }
 
@@ -1257,6 +1258,7 @@ static void port_synchronize(struct port *p,
 
 	last_state = clock_servo_state(p->clock);
 	state = clock_synchronize(p->clock, t2, t1c);
+
 	switch (state) {
 	case SERVO_UNLOCKED:
 		port_dispatch(p, EV_SYNCHRONIZATION_FAULT, 0);
@@ -1577,6 +1579,7 @@ int port_tx_announce(struct port *p, struct address *dst)
 		pr_err("port %hu: send announce failed", portnum(p));
 	}
 	msg_put(msg);
+
 	return err;
 }
 
@@ -1912,9 +1915,46 @@ int port_initialize(struct port *p)
 		p->fda.events_valid = 0;
 	}
 
+	/* For redundancy, limit the fds to be monitored:
+	 *   red master - Transport fds for tx/rx and RTNL fd, NO timer fds.
+	 *   red slave  - Timer and RTNL fds, NO trasport fds.
+	 */
+	if (red_hsr_master_port(p)) {
+		/* hsr parent port */
+		p->fda.events[FD_EVENT]   = POLLIN|POLLPRI;
+		p->fda.events[FD_GENERAL] = POLLIN|POLLPRI;
+		for (i = 0; i < N_TIMER_FDS; i++)
+			p->fda.events[FD_FIRST_TIMER + i] = 0;
+
+		p->fda.events[FD_RTNL] = POLLIN|POLLPRI;
+		p->fda.events_valid = 1;
+	} else if (red_hsr_slave_port(p)) {
+		/* hsr slave1/2 port */
+		p->fda.events[FD_EVENT]   = 0;
+		p->fda.events[FD_GENERAL] = 0;
+		for (i = 0; i < N_TIMER_FDS; i++)
+			p->fda.events[FD_FIRST_TIMER + i] = POLLIN|POLLPRI;
+
+		p->fda.events[FD_RTNL] = POLLIN|POLLPRI;
+		p->fda.events_valid = 1;
+	} else if (red_prp_master_port(p)) {
+		/* prp master does not monitior any */
+		p->fda.events[FD_EVENT]   = 0;
+		p->fda.events[FD_GENERAL] = 0;
+		for (i = 0; i < N_TIMER_FDS; i++)
+			p->fda.events[FD_FIRST_TIMER + i] = 0;
+
+		p->fda.events[FD_RTNL] = POLLIN|POLLPRI;
+		p->fda.events_valid = 1;
+	} else {
+		/* No limit on the fds to be monitored */
+		p->fda.events_valid = 0;
+	}
+
 	port_nrate_initialize(p);
 
 	clock_fda_changed(p->clock);
+
 	return 0;
 
 no_tmo:
@@ -2968,6 +3008,8 @@ void port_dispatch(struct port *p, enum fsm_event event, int mdiff)
 
 static void bc_dispatch(struct port *p, enum fsm_event event, int mdiff)
 {
+	enum port_state prev_state = p->state;
+
 	if (clock_slave_only(p->clock)) {
 		if (event == EV_RS_MASTER || event == EV_RS_GRAND_MASTER) {
 			port_slave_priority_warning(p);
@@ -2975,6 +3017,11 @@ static void bc_dispatch(struct port *p, enum fsm_event event, int mdiff)
 	}
 
 	if (!port_state_update(p, event, mdiff)) {
+		if (p->state == PS_UNCALIBRATED && mdiff) {
+			struct ptp_message *m = TAILQ_FIRST(&p->best->messages);
+
+			sk_set_ts_master_id(interface_name(p->iface), &m->address);
+		}
 		return;
 	}
 
@@ -2982,6 +3029,17 @@ static void bc_dispatch(struct port *p, enum fsm_event event, int mdiff)
 		port_p2p_transition(p, p->state);
 	} else {
 		port_e2e_transition(p, p->state);
+	}
+
+
+	/* TI specific */
+	/* In redundancy port, port state can go directly from
+	 * PSLAVE to SLAVE without going through UNCALIBRATE
+	 */
+	if ((p->state == PS_UNCALIBRATED) ||
+	    (red_slave_port(p) && prev_state == PS_PASSIVE_SLAVE && p->state == PS_SLAVE)) {
+		struct ptp_message *dst = TAILQ_FIRST(&p->best->messages);
+		sk_set_ts_master_id(interface_name(p->iface), &dst->address);
 	}
 
 	if (p->jbod && p->state == PS_UNCALIBRATED) {
@@ -3055,6 +3113,7 @@ void port_link_status(void *ctx, int linkup, int ts_index)
 static struct port *red_rx_msg_get_port(struct port *p, struct ptp_message *msg)
 {
 	uint8_t in_ports;
+	/*struct port *port = NULL;*/
 
 	in_ports = REDINFO_PORTS(MSG_REDINFO(msg));
 	if (!in_ports || (in_ports & 0x3) == 0x3) {
@@ -3204,6 +3263,7 @@ static enum fsm_event bc_event(struct port *p, int fd_index)
 		return EV_NONE;
 	}
 	port_stats_inc_rx(p, msg);
+
 	if (port_ignore(p, msg)) {
 		msg_put(msg);
 		return EV_NONE;
@@ -3390,6 +3450,7 @@ int port_prepare_and_send(struct port *p, struct ptp_message *msg,
 	if (msg_sots_valid(msg)) {
 		ts_add(&msg->hwts.ts, p->tx_timestamp_offset);
 	}
+
 	return 0;
 }
 
@@ -3763,6 +3824,8 @@ struct port *port_open(const char *phc_device,
 	else
 		p->red_port_lanid = -1;
 
+	transport = config_get_int(cfg, interface_name(interface), "network_transport");
+
 	if (transport == TRANS_UDS) {
 		; /* UDS cannot have a PHC. */
 	} else if (!interface_tsinfo_valid(interface)) {
@@ -3801,6 +3864,7 @@ struct port *port_open(const char *phc_device,
 	p->rx_timestamp_offset <<= 16;
 	p->tx_timestamp_offset = config_get_int(cfg, p->name, "egressLatency");
 	p->tx_timestamp_offset <<= 16;
+	p->ppsOffset = config_get_int(cfg, p->name, "ppsOffset");
 	p->link_status = LINK_UP;
 	p->clock = clock;
 	p->trp = transport_create(cfg, transport);
@@ -3872,6 +3936,7 @@ struct port *port_open(const char *phc_device,
 			goto err_tsproc;
 		}
 	}
+
 	return p;
 
 err_tsproc:
@@ -4002,4 +4067,9 @@ char *port_name(struct port *p)
 int red_port_quality(struct port *port)
 {
 	return port ? port->red_rx_sync_missed : 0;
+}
+
+struct port *red_get_master_port(struct port *p)
+{
+	return p->red_master_port;
 }

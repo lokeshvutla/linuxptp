@@ -341,6 +341,7 @@ struct port_properties_np {
 	struct PortIdentity portIdentity;
 	uint8_t port_state;
 	uint8_t timestamping;
+	int32_t pps_offset;
 	struct PTPText interface;
 } PACKED;
 

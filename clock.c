@@ -572,9 +572,11 @@ static void clock_stats_display(struct clock_stats *s)
 	/* Path delay stats are updated separately, they may be empty. */
 	if (!stats_get_result(s->delay, &delay_stats)) {
 		pr_info("rms %4.0f max %4.0f "
+			"(%4.0f, %4.0f) "
 			"freq %+6.0f +/- %3.0f "
 			"delay %5.0f +/- %3.0f",
 			offset_stats.rms, offset_stats.max_abs,
+			offset_stats.min, offset_stats.max,
 			freq_stats.mean, freq_stats.stddev,
 			delay_stats.mean, delay_stats.stddev);
 	} else {
@@ -1224,7 +1226,14 @@ struct clock *clock_create(enum clock_type type, struct config *config,
 		}
 	}
 
-	c->dds.numberPorts = c->nports;
+	c->dds.numberPorts = c->nports + c->n_red_master_ports;
+
+	/* Link up redundant paired ports as
+	 * well as redundant master and slave
+	 */
+	LIST_FOREACH(p, &c->ports, list) {
+		port_redundancy_setup(p);
+	}
 
 	/* Link up redundant paired ports as
 	 * well as redundant master and slave

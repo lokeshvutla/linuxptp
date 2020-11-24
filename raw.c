@@ -45,6 +45,7 @@
 #include "sk.h"
 #include "transport_private.h"
 #include "util.h"
+#include "missing.h"
 
 struct raw {
 	struct transport t;

@@ -26,6 +26,7 @@
 #include "udp.h"
 #include "udp6.h"
 #include "uds.h"
+#include "missing.h"
 
 int transport_close(struct transport *t, struct fdarray *fda)
 {

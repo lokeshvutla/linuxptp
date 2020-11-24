@@ -125,6 +125,7 @@ struct port {
 	Integer8            operLogPdelayReqInterval;
 	Integer8            logPdelayReqInterval;
 	UInteger32          neighborPropDelayThresh;
+	Integer32           ppsOffset;
 	int                 follow_up_info;
 	int                 freq_est_interval;
 	int                 hybrid_e2e;

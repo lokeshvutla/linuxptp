@@ -152,4 +152,5 @@ extern int sk_check_fupsync;
  */
 extern enum hwts_filter_mode sk_hwts_filter_mode;
 
+int sk_set_ts_master_id(const char *name, struct address *addr);
 #endif
