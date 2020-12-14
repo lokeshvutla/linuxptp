@@ -193,7 +193,7 @@ struct ptp_pin_desc {
 #endif
 
 #ifndef PTP_PPS_OFFSET
-#define PTP_PPS_OFFSET     _IOW('=', 9, int)
+#define PTP_PPS_OFFSET     _IOW('=', 19, int)
 #endif
 
 #ifndef HAVE_CLOCK_ADJTIME
