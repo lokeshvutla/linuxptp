@@ -893,6 +893,42 @@ static int read_extts(int fd, int64_t *offset, uint64_t *ts, int extts_idx)
 
 	return 1;
 }
+static int extts_slave_clear_fifo(struct clock *clock)
+{
+	clockid_t clkid = clock->clkid;
+	struct pollfd pfd = {
+		.events = POLLIN | POLLPRI,
+		.fd = CLOCKID_TO_FD(clkid),
+	};
+	struct ptp_extts_event event;
+	int cnt, size, skip_count = 0;
+
+	while (1) {
+		cnt = poll(&pfd, 1, 0);
+		if (cnt < 0) {
+			if (EINTR == errno) {
+				continue;
+			} else {
+				pr_emerg("poll failed");
+				return -1;
+			}
+		} else if (!cnt) {
+			break;
+		}
+		size = read(pfd.fd, &event, sizeof(event));
+		if (size != sizeof(event)) {
+			pr_err("read failed");
+			return -1;
+		}
+		skip_count++;
+		pr_debug("%s SKIP extts index %u at %lld.%09u",
+			 clock->device, event.index, event.t.sec, event.t.nsec);
+	}
+	pr_info("%s skipped %d extts events",
+		clock->device, skip_count);
+
+	return 0;
+}
 
 static int extts_input_control(struct clock *clock, int extts_idx, int enable)
 {
@@ -902,8 +938,10 @@ static int extts_input_control(struct clock *clock, int extts_idx, int enable)
 	memset(&extts_request, 0, sizeof(extts_request));
 	extts_request.index = extts_idx;
 
-	if (enable)
+	if (enable) {
 		extts_request.flags = PTP_ENABLE_FEATURE;
+		extts_slave_clear_fifo(clock);
+	}
 
 	if (ioctl(CLOCKID_TO_FD(clkid), PTP_EXTTS_REQUEST, &extts_request)) {
 		pr_warning("%s: failed to %sable extts",
@@ -1469,7 +1507,7 @@ static int do_autocfg_extts_loop(struct node *node, int subscriptions)
 
 					if (ret < EXTTS_INIT_CLOCKS_OK) {
 						pr_err("autocfg_extts_init_clocks failed");
-						return ret;
+						goto err_clean;
 					}
 
 					pr_info("bc internal sync start, master %s",
@@ -1516,6 +1554,7 @@ static int do_autocfg_extts_loop(struct node *node, int subscriptions)
 		}
 	}
 
+err_clean:
 	LIST_FOREACH(clock, &node->clocks, list) {
 		if ((clock->clkid != CLOCK_REALTIME) &&
 		    (!clock->dup_phc)) {
